@@ -1,6 +1,6 @@
 # bach-gpt
 
-Mechanistic interpretability of a small GPT-style transformer trained on symbolic music (MIDI). NYU CSCI-GA.3033-131 "Building LLM Reasoners" final project.
+Mechanistic interpretability of a small GPT-style transformer trained on symbolic music (MIDI).
 
 ## Layout
 
@@ -47,4 +47,4 @@ On first run, `corpus_stats.py` extracts 100 random MIDI files from the GigaMIDI
 
 ## Status
 
-Check-in (2026-04-22): tokenizer + round-trip test + three-corpus statistics pipeline complete, pretraining corpus switched from MAESTRO to GigaMIDI. No model trained, no probing yet. Next steps are in `checkin.md` §5.
+Check-in (2026-04-22): tokenizer + round-trip test + three-corpus statistics pipeline complete, pretraining corpus switched from MAESTRO to GigaMIDI. No model trained, no probing yet.

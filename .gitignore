@@ -1,0 +1,12 @@
+# Data corpora — too large for git, see README for download links
+data/
+
+# Python / OS
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+
+# Check-in deliverables (regenerated from build_giga.js + corpus_stats.py)
+checkin.docx
+checkin.md

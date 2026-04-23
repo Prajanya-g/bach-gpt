@@ -1,0 +1,6 @@
+pretty_midi>=0.2.11
+music21>=9.0
+matplotlib>=3.7
+numpy>=1.24
+pandas>=2.0
+tqdm>=4.65

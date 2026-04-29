@@ -185,7 +185,27 @@ def decode(ids: List[int], tempo: float = 120.0) -> pretty_midi.PrettyMIDI:
     """Decode a token id list back to a PrettyMIDI. Timing is reconstructed
     from the bin centers of TS and D tokens and is not exact."""
     pm = pretty_midi.PrettyMIDI(initial_tempo=tempo)
-    inst = pretty_midi.Instrument(program=0, name="piano")
+    VOICE_PROGRAMS = {
+        0: 0,   # piano
+        1: 25,  # acoustic guitar
+        2: 32,  # acoustic bass
+        3: 48,  # strings
+        4: 56,  # trumpet
+        5: 65,  # alto sax
+        6: 80,  # synth lead
+        7: 0,   # piano fallback
+    }
+    instruments: Dict[int, pretty_midi.Instrument] = {}
+    current_voice = 0
+
+    def get_inst(v: int) -> pretty_midi.Instrument:
+        if v not in instruments:
+            prog = VOICE_PROGRAMS.get(v, 0)
+            instruments[v] = pretty_midi.Instrument(
+                program=prog,
+                name=f"voice_{v}",
+            )
+        return instruments[v]
 
     current_time = 0.0
     pending_velocity = 64
@@ -201,7 +221,7 @@ def decode(ids: List[int], tempo: float = 120.0) -> pretty_midi.PrettyMIDI:
         if t.startswith("D") and t[1:].isdigit():
             return ("dur", int(t[1:]))
         if t.startswith("V") and t[1:].isdigit():
-            return ("vel", int(t[1:]))
+            return ("voice", int(t[1:]))
         if t.startswith("P") and t[1:].isdigit():
             return ("pitch", int(t[1:]))
         return ("struct", t)
@@ -213,8 +233,8 @@ def decode(ids: List[int], tempo: float = 120.0) -> pretty_midi.PrettyMIDI:
         if kind == "ts":
             current_time += _bin_center(val)
 
-        elif kind == "vel":
-            pending_velocity = _vel_center(val)
+        elif kind == "voice":
+            current_voice = int(val)
 
         elif kind == "pitch":
             duration = 0.25  # fallback
@@ -224,7 +244,7 @@ def decode(ids: List[int], tempo: float = 120.0) -> pretty_midi.PrettyMIDI:
                 if nkind == "dur":
                     duration = _bin_center(nval)
                     break
-                if nkind in ("pitch", "ts", "vel"):
+                if nkind in ("pitch", "ts", "voice"):
                     break
                 j += 1
             note = pretty_midi.Note(
@@ -233,14 +253,17 @@ def decode(ids: List[int], tempo: float = 120.0) -> pretty_midi.PrettyMIDI:
                 start=current_time,
                 end=current_time + max(duration, 0.01),
             )
-            inst.notes.append(note)
+            get_inst(current_voice).notes.append(note)
 
         elif kind == "struct" and val == "REST":
             current_time += 0.25
         # BAR_*, PHRASE_*, PAD, EOS do not affect decoded timing
         i += 1
 
-    pm.instruments.append(inst)
+    for voice in sorted(instruments):
+        inst = instruments[voice]
+        if inst.notes:
+            pm.instruments.append(inst)
     return pm
 
 

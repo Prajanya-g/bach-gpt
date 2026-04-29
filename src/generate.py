@@ -187,7 +187,11 @@ def main() -> None:
     device = _pick_device()
     print(f"[generate] device={device}")
 
-    ckpt = torch.load(args.checkpoint, map_location=device)
+    ckpt = torch.load(
+        args.checkpoint,
+        map_location=device,
+        weights_only=True,
+    )
     cfg = _load_config_from_sources(ckpt, args.config)
     model = GPT(cfg).to(device)
 

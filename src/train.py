@@ -25,7 +25,6 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 from dataset import build_dataloaders  # noqa: E402
 from model import GPT, default_gpt_config  # noqa: E402
-from tokenizer import VOCAB_SIZE  # noqa: E402
 
 
 def _lr_lambda_factory(warmup_steps: int, total_steps: int):
@@ -153,6 +152,7 @@ def train(args: argparse.Namespace) -> None:
     cfg = default_gpt_config()
     cfg.block_size = args.block_size
     cfg.dropout = args.dropout
+    cfg.vocab_size = stats.vocab_size
     model = GPT(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[train] parameters={n_params:,} (~{n_params / 1e6:.2f}M)")
@@ -182,7 +182,8 @@ def train(args: argparse.Namespace) -> None:
     config_dict: Dict[str, Any] = asdict(cfg)
     config_dict.update(
         {
-            "vocab_size": VOCAB_SIZE,
+            "vocab_size": stats.vocab_size,
+            "n_bpe_merges": stats.n_bpe_merges,
             "max_epochs": args.max_epochs,
             "batch_size": args.batch_size,
             "seed": args.seed,
@@ -208,10 +209,10 @@ def train(args: argparse.Namespace) -> None:
         with open(log_csv, "w", newline="") as f:
             csv.DictWriter(f, fieldnames=fieldnames).writeheader()
 
-    random_ce = math.log(VOCAB_SIZE)
+    random_ce = math.log(stats.vocab_size)
     print(
         f"[train] random baseline CE≈{random_ce:.3f} (nats), "
-        f"ppl≈{math.exp(random_ce):.1f} (≈vocab {VOCAB_SIZE})"
+        f"ppl≈{math.exp(random_ce):.1f} (≈vocab {stats.vocab_size})"
     )
 
     best_val = float("inf")

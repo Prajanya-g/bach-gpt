@@ -8,7 +8,7 @@ import random
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import pretty_midi
 import torch
@@ -19,8 +19,16 @@ _ROOT = _SCRIPT_DIR.parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
+from bpe import (  # noqa: E402
+    Merge,
+    apply_bpe,
+    load as load_bpe_merges,
+    unapply_bpe,
+)
 from model import GPT, GPTConfig, default_gpt_config  # noqa: E402
-from tokenizer import ID2TOKEN, VOCAB_SIZE, decode, encode  # noqa: E402
+from tokenizer import ID2TOKEN, decode, encode  # noqa: E402
+
+DEFAULT_BPE_MERGES_PATH = _ROOT / "data" / "bpe" / "merges.json"
 
 
 def _pick_device() -> torch.device:
@@ -95,15 +103,21 @@ def _load_jsb_prompt(seed: int) -> Tuple[List[int], str]:
 
 
 def _load_prompt_tokens(
-    prompt: str, prompt_tokens: int, seed: int
+    prompt: str,
+    prompt_tokens: int,
+    seed: int,
+    merges: Sequence[Merge],
+    vocab_size: int,
 ) -> Tuple[List[int], str]:
     if prompt == "random":
         rng = random.Random(seed)
-        ids = [rng.randrange(VOCAB_SIZE) for _ in range(prompt_tokens)]
+        ids = [rng.randrange(vocab_size) for _ in range(prompt_tokens)]
         return ids, "random"
 
     if prompt == "jsb":
         ids, label = _load_jsb_prompt(seed=seed)
+        if merges:
+            ids = apply_bpe(ids, merges)
         return ids[:prompt_tokens], label
 
     midi_path = Path(prompt)
@@ -111,6 +125,8 @@ def _load_prompt_tokens(
         raise FileNotFoundError(f"Prompt MIDI not found: {midi_path}")
     pm = pretty_midi.PrettyMIDI(str(midi_path))
     ids = encode(pm)
+    if merges:
+        ids = apply_bpe(ids, merges)
     return ids[:prompt_tokens], str(midi_path)
 
 
@@ -175,6 +191,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=str(_ROOT / "results" / "generated.mid"),
     )
+    p.add_argument(
+        "--bpe-merges",
+        type=str,
+        default=str(DEFAULT_BPE_MERGES_PATH),
+        help="BPE merges JSON path. Skipped silently if file missing.",
+    )
     return p.parse_args()
 
 
@@ -201,10 +223,19 @@ def main() -> None:
     model.load_state_dict(state)
     model.eval()
 
+    merges_path = Path(args.bpe_merges)
+    merges: List[Merge] = (
+        load_bpe_merges(merges_path) if merges_path.exists() else []
+    )
+    if merges:
+        print(f"[generate] BPE merges loaded: {len(merges)} from {merges_path}")
+
     prompt_ids_list, prompt_label = _load_prompt_tokens(
         prompt=args.prompt,
         prompt_tokens=args.prompt_tokens,
         seed=args.seed,
+        merges=merges,
+        vocab_size=cfg.vocab_size,
     )
     if not prompt_ids_list:
         raise ValueError("Prompt produced zero tokens.")
@@ -221,15 +252,18 @@ def main() -> None:
     prompt_len = len(prompt_ids_list)
     cont_ids = out_ids[prompt_len:]
 
+    base_out_ids = unapply_bpe(out_ids, merges) if merges else out_ids
+    base_cont_ids = unapply_bpe(cont_ids, merges) if merges else cont_ids
+
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    decode(out_ids).write(str(out_path))
+    decode(base_out_ids).write(str(out_path))
 
     cont_path = out_path.with_name(
         f"{out_path.stem}_continuation{out_path.suffix}"
     )
-    if cont_ids:
-        decode(cont_ids).write(str(cont_path))
+    if base_cont_ids:
+        decode(base_cont_ids).write(str(cont_path))
 
     print(f"[generate] prompt: {prompt_len} tokens ({prompt_label})")
     print(f"[generate] generated: {len(cont_ids)} tokens")

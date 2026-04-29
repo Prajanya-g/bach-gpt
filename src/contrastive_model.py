@@ -18,6 +18,8 @@ import torch.nn.functional as F
 from sentence_transformers import SentenceTransformer
 
 from model import GPT
+# CompoundGPT lives in compound_model; only imported for the compound
+# variant below to avoid a circular dependency when only GPT is used.
 
 
 def symmetric_infonce_loss(
@@ -265,6 +267,182 @@ class MidiTextContrastiveModel(nn.Module):
         return list(self.midi_projection.parameters()) + list(
             self.text_projection.parameters()
         ) + [self.log_temperature]
+
+    def make_optimizer_param_groups(
+        self,
+        proj_lr: float,
+        weight_decay: float = 0.0,
+        temperature_lr_scale: float = 0.1,
+    ) -> List[Dict[str, Any]]:
+        return [
+            {
+                "params": self.midi_projection.parameters(),
+                "lr": proj_lr,
+                "weight_decay": weight_decay,
+            },
+            {
+                "params": self.text_projection.parameters(),
+                "lr": proj_lr,
+                "weight_decay": weight_decay,
+            },
+            {
+                "params": [self.log_temperature],
+                "lr": proj_lr * temperature_lr_scale,
+                "weight_decay": 0.0,
+            },
+        ]
+
+
+# --- Compound (Octuple) variant ----------------------------------------------
+
+class CompoundMidiTextContrastiveModel(nn.Module):
+    """CLIP-style contrastive model with a CompoundGPT MIDI encoder.
+
+    This is the "Option C" hybrid: the contrastive encoder uses compound
+    (per-axis) MIDI inputs to learn structured musical representations,
+    while the autoregressive decoder side of the project remains the 1D +
+    BPE GPT (loaded separately at prefix-tuning time).
+
+    Inputs to ``forward`` differ from ``MidiTextContrastiveModel``:
+    - ``compound_input`` of shape (B, T, N_AXES) instead of (input_ids, attention_mask)
+    - The pad mask is derived from the step-type axis (== STEP_PAD).
+    """
+
+    def __init__(
+        self,
+        midi_compound_gpt: "CompoundGPT",
+        text_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        embed_dim: int = 256,
+        init_temperature: float = 0.07,
+        min_temperature: float = 0.01,
+        max_temperature: float = 1.0,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        super().__init__()
+        from compound import STEP_PAD          # local import to avoid cycles
+        self._step_pad = STEP_PAD
+
+        self.midi_encoder = midi_compound_gpt
+        self.text_encoder = SentenceTransformer(text_model_name)
+        self.embed_dim = embed_dim
+        self.min_temperature = min_temperature
+        self.max_temperature = max_temperature
+
+        self.midi_projection = ProjectionHead(
+            input_dim=midi_compound_gpt.config.d_model,
+            hidden_dim=512,
+            out_dim=embed_dim,
+        )
+        self.text_projection = ProjectionHead(
+            input_dim=384,
+            hidden_dim=512,
+            out_dim=embed_dim,
+        )
+
+        self.log_temperature = nn.Parameter(
+            torch.tensor(math.log(init_temperature))
+        )
+
+        if device is not None:
+            self.to(device)
+
+        self.freeze_midi_encoder()
+        self.freeze_text_encoder()
+
+    def freeze_midi_encoder(self) -> None:
+        for p in self.midi_encoder.parameters():
+            p.requires_grad = False
+        self.midi_encoder.eval()
+
+    def freeze_text_encoder(self) -> None:
+        for p in self.text_encoder.parameters():
+            p.requires_grad = False
+        self.text_encoder.eval()
+
+    def unfreeze_text_encoder(self) -> None:
+        for p in self.text_encoder.parameters():
+            p.requires_grad = True
+        self.text_encoder.train()
+
+    def encode_midi(self, compound_input: torch.Tensor) -> torch.Tensor:
+        """compound_input: (B, T, N_AXES) long. Returns pooled (B, d_model).
+        Pad steps (step-axis == STEP_PAD) are excluded from the mean pool."""
+        with torch.no_grad():
+            hidden = self.midi_encoder(compound_input, return_hidden=True)
+            mask = (compound_input[..., 0] != self._step_pad).to(hidden.dtype)
+            mask = mask.unsqueeze(-1)
+            summed = (hidden * mask).sum(dim=1)
+            denom = mask.sum(dim=1).clamp_min(1.0)
+            pooled = summed / denom
+        return pooled
+
+    def encode_text(
+        self, captions: List[str], device: torch.device
+    ) -> torch.Tensor:
+        text_trainable = any(p.requires_grad for p in self.text_encoder.parameters())
+        if text_trainable:
+            features = self.text_encoder.tokenize(captions)
+            features = {
+                k: v.to(device) if hasattr(v, "to") else v
+                for k, v in features.items()
+            }
+            out = self.text_encoder(features)
+            emb = out.get("sentence_embedding")
+            if emb is None:
+                emb = out.get("sentence_embeddings")
+            if emb is None:
+                emb = next(iter(out.values()))
+            return emb
+
+        with torch.no_grad():
+            return self.text_encoder.encode(
+                captions,
+                convert_to_tensor=True,
+                device=str(device),
+                normalize_embeddings=False,
+            )
+
+    def get_temperature(self) -> torch.Tensor:
+        return torch.exp(self.log_temperature).clamp(
+            self.min_temperature, self.max_temperature
+        )
+
+    def forward(
+        self,
+        compound_input: torch.Tensor,
+        captions: List[str],
+    ) -> Dict[str, torch.Tensor]:
+        device = compound_input.device
+
+        midi_features = self.encode_midi(compound_input)
+        text_features = self.encode_text(captions, device=device)
+
+        midi_proj = self.midi_projection(midi_features)
+        text_proj = self.text_projection(text_features)
+
+        midi_embeds = F.normalize(midi_proj, p=2, dim=-1)
+        text_embeds = F.normalize(text_proj, p=2, dim=-1)
+
+        temperature = self.get_temperature()
+        loss_out = symmetric_infonce_loss(
+            midi_embeds=midi_embeds,
+            text_embeds=text_embeds,
+            temperature=temperature,
+        )
+
+        return {
+            "midi_embeds": midi_embeds,
+            "text_embeds": text_embeds,
+            "temperature": temperature,
+            **loss_out,
+        }
+
+    def trainable_parameters(self):
+        return (
+            list(self.midi_projection.parameters())
+            + list(self.text_projection.parameters())
+            + [self.log_temperature]
+        )
 
     def make_optimizer_param_groups(
         self,

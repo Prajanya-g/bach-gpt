@@ -5,7 +5,7 @@ Mechanistic interpretability experiments on a small GPT-style transformer traine
 ## What this repo contains
 
 - MIDI tokenizer with a fixed symbolic vocabulary and round-trip checks.
-- Data pipeline for building token chunks from sampled GigaMIDI files.
+- Data pipeline for building token chunks from sampled MidiCaps files.
 - GPT training + checkpointing + CSV logging + Weights and Biases logging.
 - MIDI generation from checkpoints (random, JSB, or custom MIDI prompts).
 - Captioning pipeline (`caption_midi.py` -> `llm_caption.py`) for text-conditioned training data.
@@ -67,37 +67,28 @@ For CUDA-specific wheels, use the [PyTorch install selector](https://pytorch.org
 
 `data/` is gitignored. You need local dataset files before training.
 
-- **GigaMIDI** (pretraining corpus, gated): [Metacreation/GigaMIDI](https://huggingface.co/datasets/Metacreation/GigaMIDI)
+- **MidiCaps** (primary MIDI-caption dataset): [amaai-lab/MidiCaps](https://huggingface.co/datasets/amaai-lab/MidiCaps)
 - **JSB Chorales** (probing/statistics): loaded through `music21` corpus APIs (no manual download in this repo).
 
-### Download GigaMIDI from Hugging Face
+### Download MidiCaps from Hugging Face
 
-After accepting dataset terms and creating a read token:
+Download and unpack the dataset from the Hugging Face page:
 
-```bash
-export HF_TOKEN=hf_...
-python3 src/download.py
-```
+- [amaai-lab/MidiCaps](https://huggingface.co/datasets/amaai-lab/MidiCaps)
 
-This downloads into `data/Final_GigaMIDI_V1.1_Final/` by default.
+Then place MIDI files under your local data directory (for example `data/midicaps/`).
 
 ## Build a local training sample
 
-### Recommended (parquet workflow)
-
-If your snapshot contains parquet files (for example `all-instruments-with-drums/train.parquet`):
+### Recommended workflow
 
 ```bash
 python3 src/extract_gigamidi_sample.py \
-  --parquet data/Final_GigaMIDI_V1.1_Final/all-instruments-with-drums/train.parquet \
-  --out-dir data/gigamidi/sample \
+  --parquet data/midicaps/train.parquet \
+  --out-dir data/midicaps/sample \
   --n-samples 100 \
   --seed 17
 ```
-
-### Zip workflow
-
-If you have `training-V1.1-80%/all-instruments-with-drums.zip` under `data/Final_GigaMIDI_V1.1_Final/`, `src/corpus_stats.py` can auto-extract a 100-file sample into `data/gigamidi/sample/` on first run.
 
 ## Typical run sequence
 
@@ -136,7 +127,7 @@ Generate JSONL captions from local MIDI files:
 
 ```bash
 python3 caption_midi.py \
-  --midi_dir data/gigamidi/sample \
+  --midi_dir data/midicaps/sample \
   --output data/captions.jsonl \
   --limit 10000
 ```

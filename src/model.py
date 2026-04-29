@@ -30,11 +30,11 @@ from tokenizer import VOCAB_SIZE
 @dataclass
 class GPTConfig:
     vocab_size: int = VOCAB_SIZE
-    block_size: int = 512
-    d_model: int = 256
-    n_layers: int = 4
-    n_heads: int = 4
-    d_ff: int = 1024
+    block_size: int = 1024
+    d_model: int = 512
+    n_layers: int = 6
+    n_heads: int = 8
+    d_ff: int = 2048
     dropout: float = 0.1
 
 

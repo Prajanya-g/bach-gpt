@@ -222,7 +222,7 @@ def run_transformers(prompts: list[str], model_name: str,
         model_name,
         quantization_config=quant_cfg,
         device_map="auto",
-        torch_dtype=torch.bfloat16 if not quantize else None,
+        dtype=torch.bfloat16 if not quantize else None,
     )
     model.eval()
 

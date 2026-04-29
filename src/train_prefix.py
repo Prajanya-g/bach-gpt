@@ -65,6 +65,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--split-ratio", type=float, default=0.95)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=17)
+    p.add_argument(
+        "--results-dir",
+        type=str,
+        default=str(_ROOT / "results"),
+    )
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.01)
@@ -229,6 +234,9 @@ def _generate_with_text_prefix(
     gen_tokens: int,
     device: torch.device,
 ) -> List[int]:
+    # Diagnostic-only helper for qualitative checks during training.
+    # This re-runs full prefix+GPT forward each token (O(n^2)); production
+    # inference should use cached decoding in generate_conditional.py.
     ids: List[int] = [PHRASE_START]
     for _ in range(gen_tokens):
         x = torch.tensor([ids], dtype=torch.long, device=device)
@@ -485,8 +493,24 @@ def main() -> None:
             print(f"[phase3] genre ppl_gap(with-without): {parts}")
         if epoch >= 10 and val_loss >= baseline_val:
             print("[phase3][warn] prefix loss not below no-prefix baseline.")
+
+        ckpt_dir = Path(
+            args.results_dir
+            if hasattr(args, "results_dir")
+            else _ROOT / "results"
+        ) / "checkpoints_prefix"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+        ckpt = {
+            "projector_state_dict": projector.state_dict(),
+            "epoch": epoch,
+            "val_loss": val_loss,
+            "args": vars(args),
+        }
+        torch.save(ckpt, ckpt_dir / "prefix_projector_latest.pt")
         if val_loss < best_val:
             best_val = val_loss
+            torch.save(ckpt, ckpt_dir / "prefix_projector_best.pt")
 
         _prefix_token_scale_diagnostics(
             clap_model=clap_model,

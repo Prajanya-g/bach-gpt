@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib
 import math
 import sys
 import time
@@ -13,7 +14,6 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.nn.functional as F
-import wandb
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
@@ -220,21 +220,30 @@ def train(args: argparse.Namespace) -> None:
     train_loss_count = 0
     last_val_loss: Optional[float] = None
 
-    wandb.init(
-        project="bach-gpt",
-        name="v2-25M-5k-files",
-        config={
-            "d_model": cfg.d_model,
-            "n_layers": cfg.n_layers,
-            "n_heads": cfg.n_heads,
-            "d_ff": cfg.d_ff,
-            "block_size": cfg.block_size,
-            "batch_size": args.batch_size,
-            "max_epochs": args.max_epochs,
-            "warmup_steps": args.warmup_steps,
-            "sample_dir": args.sample_dir or "sample_5k",
-        },
-    )
+    use_wandb = False
+    wandb = None
+    try:
+        _wandb = importlib.import_module("wandb")
+
+        _wandb.init(
+            project="bach-gpt",
+            name="v2-25M-5k-files",
+            config={
+                "d_model": cfg.d_model,
+                "n_layers": cfg.n_layers,
+                "n_heads": cfg.n_heads,
+                "d_ff": cfg.d_ff,
+                "block_size": cfg.block_size,
+                "batch_size": args.batch_size,
+                "max_epochs": args.max_epochs,
+                "warmup_steps": args.warmup_steps,
+                "sample_dir": args.sample_dir or "sample_5k",
+            },
+        )
+        wandb = _wandb
+        use_wandb = True
+    except Exception:
+        print("[train] wandb not available, logging to CSV only")
 
     model.train()
     t0 = time.perf_counter()
@@ -271,17 +280,19 @@ def train(args: argparse.Namespace) -> None:
                         train_ppl = float("inf")
                     print(
                         f"[train] step={global_step} epoch={epoch} "
-                        f"train_loss={avg_train:.4f} train_ppl={train_ppl:.2f} "
+                        f"train_loss={avg_train:.4f} "
+                        f"train_ppl={train_ppl:.2f} "
                         f"lr={lr:.2e}"
                     )
-                    wandb.log(
-                        {
-                            "train/loss": avg_train,
-                            "train/ppl": train_ppl,
-                            "lr": lr,
-                        },
-                        step=global_step,
-                    )
+                    if use_wandb and wandb is not None:
+                        wandb.log(
+                            {
+                                "train/loss": avg_train,
+                                "train/ppl": train_ppl,
+                                "lr": lr,
+                            },
+                            step=global_step,
+                        )
                     append_csv_row(
                         log_csv,
                         fieldnames,
@@ -315,13 +326,14 @@ def train(args: argparse.Namespace) -> None:
                         f"[val] step={global_step} val_loss={val_loss:.4f} "
                         f"val_ppl={val_ppl:.2f}"
                     )
-                    wandb.log(
-                        {
-                            "val/loss": val_loss,
-                            "val/ppl": val_ppl,
-                        },
-                        step=global_step,
-                    )
+                    if use_wandb and wandb is not None:
+                        wandb.log(
+                            {
+                                "val/loss": val_loss,
+                                "val/ppl": val_ppl,
+                            },
+                            step=global_step,
+                        )
                     append_csv_row(
                         log_csv,
                         fieldnames,
@@ -364,7 +376,8 @@ def train(args: argparse.Namespace) -> None:
                     )
                     print(f"[train] saved {ckpt_path}")
     finally:
-        wandb.finish()
+        if use_wandb and wandb is not None:
+            wandb.finish()
 
     elapsed = time.perf_counter() - t0
     print(

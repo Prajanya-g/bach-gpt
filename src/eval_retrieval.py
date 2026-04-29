@@ -141,6 +141,11 @@ def genre_r1_breakdown(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate CLAP retrieval metrics.")
     p.add_argument(
+        "--results-dir",
+        type=str,
+        default=str(_ROOT / "results"),
+    )
+    p.add_argument(
         "--captions-jsonl",
         type=str,
         default=str(_ROOT / "data" / "captions_llm.jsonl"),
@@ -148,14 +153,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--midi-checkpoint",
         type=str,
-        default=str(_ROOT / "results" / "checkpoints" / "best_model.pt"),
+        default="",
     )
     p.add_argument(
         "--clap-checkpoint",
         type=str,
-        default=str(
-            _ROOT / "results" / "checkpoints_contrastive" / "clap_best.pt"
-        ),
+        default="",
     )
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--max-seq-len", type=int, default=512)
@@ -165,13 +168,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--out-json",
         type=str,
-        default=str(_ROOT / "results" / "retrieval_eval.json"),
+        default="",
     )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    results_dir = Path(args.results_dir)
+    if not args.midi_checkpoint:
+        args.midi_checkpoint = str(
+            results_dir / "checkpoints" / "best_model.pt"
+        )
+    if not args.clap_checkpoint:
+        args.clap_checkpoint = str(
+            results_dir / "checkpoints_contrastive" / "clap_best.pt"
+        )
+    if not args.out_json:
+        args.out_json = str(results_dir / "retrieval_eval.json")
     device = _pick_device()
     print(f"[retrieval] device={device}")
 

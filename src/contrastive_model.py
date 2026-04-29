@@ -165,6 +165,8 @@ class MidiTextContrastiveModel(nn.Module):
             # Expected for this repo's custom GPT; use hook fallback below.
             pass
 
+        # Hook fallback uses instance state and is not concurrency-safe across
+        # overlapping forward passes on the same model instance.
         self._last_hidden = None
         hook = self.midi_encoder.blocks[-1].register_forward_hook(
             self._capture_last_hidden_hook
@@ -207,7 +209,12 @@ class MidiTextContrastiveModel(nn.Module):
                 for k, v in features.items()
             }
             out = self.text_encoder(features)
-            return out["sentence_embedding"]
+            emb = out.get("sentence_embedding")
+            if emb is None:
+                emb = out.get("sentence_embeddings")
+            if emb is None:
+                emb = next(iter(out.values()))
+            return emb
 
         with torch.no_grad():
             return self.text_encoder.encode(

@@ -66,6 +66,9 @@ class MidiCaptionDataset(Dataset):
         self._rng = random.Random(seed)
         self._token_cache: Dict[int, Optional[List[int]]] = {}
         self._valid_indices: set[int] = set()
+        self._n_tokenize_failures = 0
+        self._n_short_records = 0
+        self._did_full_scan = False
 
     def __len__(self) -> int:
         return len(self.records)
@@ -80,13 +83,12 @@ class MidiCaptionDataset(Dataset):
             pm = pretty_midi.PrettyMIDI(str(midi_path))
             ids = encode(pm)
         except Exception:
+            self._n_tokenize_failures += 1
             self._token_cache[idx] = None
             return None
 
-        # Keep only sequences that can produce a full fixed-length crop.
         if len(ids) < self.max_seq_len:
-            self._token_cache[idx] = None
-            return None
+            self._n_short_records += 1
 
         self._token_cache[idx] = ids
         self._valid_indices.add(idx)
@@ -99,17 +101,38 @@ class MidiCaptionDataset(Dataset):
             return ids[start:start + self.max_seq_len]
         return ids[: self.max_seq_len]
 
+    def _window_with_mask(self, ids: List[int]) -> tuple[List[int], List[int]]:
+        window = self._crop(ids)
+        valid_len = len(window)
+        if valid_len < self.max_seq_len:
+            window = window + [0] * (self.max_seq_len - valid_len)
+        attention_mask = [1] * valid_len + [0] * (self.max_seq_len - valid_len)
+        return window, attention_mask
+
+    def _log_scan_summary(self) -> None:
+        n_cached_valid = len(self._valid_indices)
+        n_cached_invalid = sum(
+            1 for v in self._token_cache.values() if v is None
+        )
+        print(
+            "[caption_dataloader] scan summary: "
+            f"records={len(self.records)} valid={n_cached_valid} "
+            f"tokenize_failures={self._n_tokenize_failures} "
+            f"shorter_than_max_seq_len={self._n_short_records} "
+            f"invalid={n_cached_invalid}"
+        )
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         ids = self._tokenize_record(idx)
 
         # If this file cannot be parsed/tokenized, sample another valid item.
         if ids is None:
             if not self._valid_indices:
-                # Warmup pass to discover valid indices lazily.
+                # Warmup pass to discover all valid indices and diagnostics.
                 for probe_idx in range(len(self.records)):
                     self._tokenize_record(probe_idx)
-                    if self._valid_indices:
-                        break
+                self._did_full_scan = True
+                self._log_scan_summary()
             if not self._valid_indices:
                 raise RuntimeError(
                     "No valid MIDI records found that meet max_seq_len."
@@ -121,14 +144,20 @@ class MidiCaptionDataset(Dataset):
             rec = self.records[idx]
 
         assert ids is not None
-        window = self._crop(ids)
+        if (
+            not self._did_full_scan
+            and len(self._token_cache) == len(self.records)
+        ):
+            self._did_full_scan = True
+            self._log_scan_summary()
+        window, attention_mask = self._window_with_mask(ids)
         caption = _caption_from_record(rec)
 
         input_ids = torch.tensor(window, dtype=torch.long)
-        attention_mask = torch.ones(self.max_seq_len, dtype=torch.long)
+        attention_mask_t = torch.tensor(attention_mask, dtype=torch.long)
         return {
             "input_ids": input_ids,
-            "attention_mask": attention_mask,
+            "attention_mask": attention_mask_t,
             "caption": caption,
             "path": str(rec.get("path", "")),
         }

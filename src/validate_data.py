@@ -3,6 +3,7 @@
 Supports common layouts:
 - v1.1 local unzip: training-V1.1-80%/all-instruments-with-drums.zip or that folder
 - Hugging Face snapshot: Final_GigaMIDI_V1.1_Final/all-instruments-with-drums/
+  (often **shard .zip files** with .mid inside, not loose MIDI files)
 
 Usage:
   python3 src/validate_data.py
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import zipfile
 from pathlib import Path
 from typing import Optional
 
@@ -21,10 +23,14 @@ def _status(ok: bool) -> str:
     return "OK" if ok else "MISSING"
 
 
-def _count_midis(path: Path) -> int:
-    if not path.exists():
+def _count_midis(path: Optional[Path]) -> int:
+    if path is None or not path.exists():
         return 0
-    return len(list(path.rglob("*.mid"))) + len(list(path.rglob("*.midi")))
+    n = 0
+    for p in path.rglob("*"):
+        if p.is_file() and p.suffix.lower() in (".mid", ".midi"):
+            n += 1
+    return n
 
 
 def _find_all_instruments_dir(giga_root: Path) -> Optional[Path]:
@@ -41,6 +47,31 @@ def _find_all_instruments_dir(giga_root: Path) -> Optional[Path]:
     return None
 
 
+def _list_shard_zips(all_inst_dir: Optional[Path]) -> list[Path]:
+    if all_inst_dir is None or not all_inst_dir.is_dir():
+        return []
+    return sorted(
+        p
+        for p in all_inst_dir.rglob("*.zip")
+        if "__MACOSX" not in p.parts
+    )
+
+
+def _probe_midi_inside_zips(zips: list[Path], max_open: int = 16) -> bool:
+    """True if any opened shard contains at least one MIDI member."""
+    for zp in zips[:max_open]:
+        try:
+            with zipfile.ZipFile(zp) as z:
+                if any(
+                    Path(nm).suffix.lower() in (".mid", ".midi")
+                    for nm in z.namelist()
+                ):
+                    return True
+        except (zipfile.BadZipFile, OSError):
+            continue
+    return False
+
+
 def validate_layout(data_root: Path) -> int:
     giga_root = data_root / "Final_GigaMIDI_V1.1_Final"
     train_outer_zip = giga_root / "training-V1.1-80%.zip"
@@ -51,7 +82,11 @@ def validate_layout(data_root: Path) -> int:
     nested_zip = train_dir / "all-instruments-with-drums.zip"
     flat_zip = giga_root / "all-instruments-with-drums.zip"
     all_inst_dir = _find_all_instruments_dir(giga_root)
-    train_midi_count = _count_midis(all_inst_dir) if all_inst_dir else 0
+    train_midi_loose = _count_midis(all_inst_dir)
+
+    shard_zips = _list_shard_zips(all_inst_dir)
+    shard_zip_count = len(shard_zips)
+    midi_in_shards = _probe_midi_inside_zips(shard_zips) if shard_zips else False
 
     drums_zip = train_dir / "drums-only.zip"
     nodrums_zip = train_dir / "no-drums.zip"
@@ -59,8 +94,9 @@ def validate_layout(data_root: Path) -> int:
     sample_dir = data_root / "gigamidi" / "sample"
 
     has_zip = nested_zip.exists() or flat_zip.exists()
-    has_dir_midis = train_midi_count > 0
-    has_train_source = has_zip or has_dir_midis
+    has_loose_midis = train_midi_loose > 0
+    has_shard_midis = shard_zip_count > 0 and midi_in_shards
+    has_train_source = has_zip or has_loose_midis or has_shard_midis
 
     checks = [
         ("data root", data_root.exists()),
@@ -71,8 +107,10 @@ def validate_layout(data_root: Path) -> int:
         ("training-V1.1-80% directory (v1.1 nested)", train_dir.exists()),
         ("training-V1.1-80%/all-instruments-with-drums.zip", nested_zip.exists()),
         ("Final_.../all-instruments-with-drums.zip (flat)", flat_zip.exists()),
-        ("all-instruments-with-drums/ (extracted)", all_inst_dir is not None),
-        ("MIDI files under all-instruments-with-drums", has_dir_midis),
+        ("all-instruments-with-drums/ (directory)", all_inst_dir is not None),
+        ("loose .mid/.midi under that tree", has_loose_midis),
+        (".zip shard files under that tree", shard_zip_count > 0),
+        ("MIDI entries inside shard zips (probed)", midi_in_shards),
         ("drums-only.zip (optional)", drums_zip.exists()),
         ("no-drums.zip (optional)", nodrums_zip.exists()),
     ]
@@ -81,19 +119,30 @@ def validate_layout(data_root: Path) -> int:
     for label, ok in checks:
         print(f"  - {_status(ok):>7} : {label}")
 
-    if all_inst_dir and not has_dir_midis:
+    if all_inst_dir is not None:
         print(
-            f"\n[validate_data] NOTE: found directory {all_inst_dir} "
-            "but no .mid/.midi files (still unzipping or empty?)."
+            f"\n[validate_data] INFO: {all_inst_dir} — "
+            f"loose MIDIs={train_midi_loose}, .zip shards={shard_zip_count}"
         )
 
-    sample_count = _count_midis(sample_dir)
+    if all_inst_dir and not has_loose_midis and shard_zip_count == 0:
+        print(
+            "\n[validate_data] NOTE: all-instruments-with-drums/ has no "
+            "loose MIDI and no .zip shards — download may be incomplete."
+        )
+    elif all_inst_dir and shard_zip_count > 0 and not midi_in_shards:
+        print(
+            "\n[validate_data] NOTE: found .zip shards but no MIDI entries "
+            "in the first opened shards (corrupt zips or still syncing?)."
+        )
+
+    sample_n = _count_midis(sample_dir)
     print("\n[validate_data] Sample cache:")
     print(f"  - {_status(sample_dir.exists()):>7} : {sample_dir}")
-    print(f"  - {'INFO':>7} : sample MIDI files found = {sample_count}")
+    print(f"  - {'INFO':>7} : sample MIDI files found = {sample_n}")
 
-    hard_requirements_ok = data_root.exists() and giga_root.exists() and (
-        has_train_source
+    hard_requirements_ok = (
+        data_root.exists() and giga_root.exists() and has_train_source
     )
 
     print("\n[validate_data] Result:")
@@ -101,9 +150,11 @@ def validate_layout(data_root: Path) -> int:
         if nested_zip.exists():
             print("  PASS: nested zip (v1.1 layout).")
         elif flat_zip.exists():
-            print("  PASS: flat all-instruments-with-drums.zip (Hub / flat layout).")
+            print("  PASS: flat all-instruments-with-drums.zip.")
+        elif has_loose_midis:
+            print("  PASS: loose MIDI files under all-instruments-with-drums/.")
         else:
-            print("  PASS: extracted all-instruments-with-drums/ with MIDI files.")
+            print("  PASS: MIDI inside .zip shards under all-instruments-with-drums/.")
         return 0
 
     print("  FAIL: no usable GigaMIDI training source.")
@@ -111,8 +162,8 @@ def validate_layout(data_root: Path) -> int:
     print(
         "    - .../training-V1.1-80%/all-instruments-with-drums.zip\n"
         "    - .../all-instruments-with-drums.zip\n"
-        "    - .../all-instruments-with-drums/ (recursive .mid/.midi)\n"
-        "    (folder name may have stray spaces; we match strip().)"
+        "    - .../all-instruments-with-drums/**/*.mid (recursive)\n"
+        "    - .../all-instruments-with-drums/**/*.zip containing .mid/.midi"
     )
     return 1
 

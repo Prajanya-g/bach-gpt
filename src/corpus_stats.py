@@ -92,9 +92,93 @@ def _gigamidi_all_instruments_dir() -> Optional[Path]:
     return None
 
 
+def _is_midi_suffix(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in (".mid", ".midi")
+
+
 def _collect_midi_paths(source: Path) -> List[Path]:
-    mid = list(source.rglob("*.mid")) + list(source.rglob("*.midi"))
-    return [p for p in mid if not p.name.startswith(".")]
+    return [
+        p
+        for p in source.rglob("*")
+        if _is_midi_suffix(p) and not p.name.startswith(".")
+    ]
+
+
+def _count_midi_zip_entries(zp: Path) -> int:
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(zp) as z:
+            return sum(
+                1
+                for nm in z.namelist()
+                if Path(nm).suffix.lower() in (".mid", ".midi")
+                and "__MACOSX" not in nm
+            )
+    except (zipfile.BadZipFile, OSError):
+        return 0
+
+
+def _iter_shard_zips(source_dir: Path) -> List[Path]:
+    return sorted(
+        p
+        for p in source_dir.rglob("*.zip")
+        if "__MACOSX" not in p.parts
+    )
+
+
+def _ensure_gigamidi_from_shard_zips(
+    source_dir: Path, n: int, sample_dir: Path
+) -> int:
+    """Sample MIDIs from nested .zip shards (typical Hugging Face tree)."""
+    import shutil
+    import zipfile
+
+    zips = _iter_shard_zips(source_dir)
+    if not zips:
+        return 0
+
+    total_files = sum(_count_midi_zip_entries(zp) for zp in zips)
+    if total_files == 0:
+        return 0
+
+    existing = list(sample_dir.glob("*.mid")) + list(
+        sample_dir.glob("*.midi")
+    )
+    if len(existing) >= n:
+        return total_files
+
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(RNG_SEED)
+    needed = n - len(existing)
+    copied = 0
+    rng.shuffle(zips)
+    for zp in zips:
+        if copied >= needed:
+            break
+        try:
+            with zipfile.ZipFile(zp) as z:
+                members = [
+                    m
+                    for m in z.namelist()
+                    if Path(m).suffix.lower() in (".mid", ".midi")
+                    and "__MACOSX" not in m
+                ]
+                if not members:
+                    continue
+                rng.shuffle(members)
+                for nm in members:
+                    if copied >= needed:
+                        break
+                    dest = sample_dir / Path(nm).name
+                    if dest.exists():
+                        continue
+                    with z.open(nm) as src, open(dest, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    copied += 1
+        except (zipfile.BadZipFile, OSError):
+            continue
+    return total_files
 
 
 # --- Corpus loaders -----------------------------------------------------------
@@ -206,8 +290,8 @@ def _ensure_gigamidi_sample(n: int, sample_dir: Path) -> int:
             all_midi = [
                 nm
                 for nm in z.namelist()
-                if (nm.endswith(".mid") or nm.endswith(".midi"))
-                and not nm.startswith("__MACOSX/")
+                if Path(nm).suffix.lower() in (".mid", ".midi")
+                and "__MACOSX" not in nm
             ]
             total_files = len(all_midi)
 
@@ -239,28 +323,30 @@ def _ensure_gigamidi_sample(n: int, sample_dir: Path) -> int:
         return 0
 
     all_paths = _collect_midi_paths(source_dir)
-    total_files = len(all_paths)
-    if total_files == 0:
-        return 0
+    if all_paths:
+        total_files = len(all_paths)
+        existing = list(sample_dir.glob("*.mid")) + list(
+            sample_dir.glob("*.midi")
+        )
+        if len(existing) >= n:
+            return total_files
 
-    existing = list(sample_dir.glob("*.mid")) + list(sample_dir.glob("*.midi"))
-    if len(existing) >= n:
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        rng = random.Random(RNG_SEED)
+        rng.shuffle(all_paths)
+        needed = n - len(existing)
+        copied = 0
+        for src_path in all_paths:
+            if copied >= needed:
+                break
+            dest = sample_dir / src_path.name
+            if dest.exists():
+                continue
+            shutil.copy2(src_path, dest)
+            copied += 1
         return total_files
 
-    sample_dir.mkdir(parents=True, exist_ok=True)
-    rng = random.Random(RNG_SEED)
-    rng.shuffle(all_paths)
-    needed = n - len(existing)
-    copied = 0
-    for src_path in all_paths:
-        if copied >= needed:
-            break
-        dest = sample_dir / src_path.name
-        if dest.exists():
-            continue
-        shutil.copy2(src_path, dest)
-        copied += 1
-    return total_files
+    return _ensure_gigamidi_from_shard_zips(source_dir, n, sample_dir)
 
 
 def load_gigamidi(n: int) -> Tuple[List[Tuple[str, pretty_midi.PrettyMIDI]], int]:

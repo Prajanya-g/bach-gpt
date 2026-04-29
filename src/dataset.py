@@ -62,8 +62,8 @@ def load_encoded_sequences(sample_dir: Path) -> tuple[List[List[int]], int]:
     Files that fail parsing/encoding are skipped.
     """
     midi_paths = (
-        sorted(sample_dir.glob("*.mid"))
-        + sorted(sample_dir.glob("*.midi"))
+        sorted(sample_dir.rglob("*.mid"))
+        + sorted(sample_dir.rglob("*.midi"))
     )
     sequences: List[List[int]] = []
     n_failed = 0
@@ -148,8 +148,8 @@ def build_dataloaders(
         raise FileNotFoundError(f"Sample directory not found: {sample_dir}")
 
     midi_paths = (
-        sorted(sample_dir.glob("*.mid"))
-        + sorted(sample_dir.glob("*.midi"))
+        sorted(sample_dir.rglob("*.mid"))
+        + sorted(sample_dir.rglob("*.midi"))
     )
     sequences, n_failed = load_encoded_sequences(sample_dir=sample_dir)
     token_stream = concat_with_eos(sequences)

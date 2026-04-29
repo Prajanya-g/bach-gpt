@@ -11,18 +11,12 @@ returned for probing (``return_attn=True``).
 
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-_SCRIPT_DIR = Path(__file__).resolve().parent
-if str(_SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPT_DIR))
 
 from tokenizer import VOCAB_SIZE
 
@@ -44,7 +38,7 @@ def default_gpt_config() -> GPTConfig:
 
 
 class CausalSelfAttention(nn.Module):
-    """Multi-head causal self-attention; exposes softmax weights when needed."""
+    """Multi-head causal self-attention with optional weight return."""
 
     def __init__(
         self,
@@ -68,30 +62,52 @@ class CausalSelfAttention(nn.Module):
 
         # [1, 1, block_size, block_size] boolean mask: 1 = allowed
         mask = torch.tril(torch.ones(block_size, block_size, dtype=torch.bool))
-        self.register_buffer("causal_mask", mask.view(1, 1, block_size, block_size))
+        self.register_buffer(
+            "causal_mask", mask.view(1, 1, block_size, block_size)
+        )
 
     def forward(
-        self, x: torch.Tensor, return_attn: bool = False
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        B, T, C = x.shape
+        self,
+        x: torch.Tensor,
+        return_attn: bool = False,
+        use_cache: bool = False,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ]:
+        B, Tq, C = x.shape
         qkv = self.qkv(x)
-        qkv = qkv.view(B, T, 3, self.n_heads, self.head_dim)
+        qkv = qkv.view(B, Tq, 3, self.n_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+
         att = (q @ k.transpose(-2, -1)) * self.scale
-        causal = self.causal_mask[:, :, :T, :T]
-        att = att.masked_fill(~causal, float("-inf"))
+        Tk = k.size(2)
+        past_len = Tk - Tq
+        key_pos = torch.arange(Tk, device=x.device).unsqueeze(0)
+        query_pos = (
+            torch.arange(Tq, device=x.device).unsqueeze(1) + past_len
+        )
+        causal = key_pos <= query_pos
+        att = att.masked_fill(~causal.unsqueeze(0).unsqueeze(0), float("-inf"))
         att_weights = F.softmax(att, dim=-1)
         att_weights = self.attn_drop(att_weights)
 
         out = att_weights @ v
-        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        out = out.transpose(1, 2).contiguous().view(B, Tq, C)
         out = self.resid_drop(self.proj(out))
+        present = (k, v) if use_cache else None
 
         if return_attn:
-            return out, att_weights
-        return out, None
+            return out, att_weights, present
+        return out, None, present
 
 
 class TransformerBlock(nn.Module):
@@ -113,16 +129,29 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, return_attn: bool = False
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        h, attn_w = self.attn(self.ln1(x), return_attn=return_attn)
+        self,
+        x: torch.Tensor,
+        return_attn: bool = False,
+        use_cache: bool = False,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ]:
+        h, attn_w, present = self.attn(
+            self.ln1(x),
+            return_attn=return_attn,
+            use_cache=use_cache,
+            past_kv=past_kv,
+        )
         x = x + h
         x = x + self.mlp(self.ln2(x))
-        return x, attn_w
+        return x, attn_w, present
 
 
 class GPT(nn.Module):
-    """Decoder-only transformer LM with optional per-layer attention outputs."""
+    """Decoder-only transformer LM with optional attention outputs."""
 
     def __init__(self, config: GPTConfig) -> None:
         super().__init__()
@@ -151,36 +180,101 @@ class GPT(nn.Module):
 
     def forward(
         self,
-        idx: torch.Tensor,
+        idx: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
         return_attn: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
-        """Compute logits for token indices ``idx`` of shape (B, T).
+        use_cache: bool = False,
+        past_key_values: Optional[
+            List[Tuple[torch.Tensor, torch.Tensor]]
+        ] = None,
+    ) -> Union[
+        torch.Tensor,
+        Tuple[torch.Tensor, List[torch.Tensor]],
+        Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]],
+        Tuple[
+            torch.Tensor,
+            List[torch.Tensor],
+            List[Tuple[torch.Tensor, torch.Tensor]],
+        ],
+    ]:
+        """Compute logits for token inputs.
+
+        Provide exactly one of:
+        - ``idx``: token ids of shape (B, T), or
+        - ``inputs_embeds``: precomputed embeddings of shape (B, T, d_model)
 
         If ``return_attn`` is True, also returns a list of attention weight
         tensors, one per layer, each shaped (B, n_heads, T, T) after softmax.
         """
-        B, T = idx.shape
+        if (idx is None) == (inputs_embeds is None):
+            raise ValueError("Provide exactly one of idx or inputs_embeds.")
+
+        if inputs_embeds is not None:
+            B, T, C = inputs_embeds.shape
+            if C != self.config.d_model:
+                raise ValueError(
+                    "inputs_embeds last dim "
+                    f"{C} != d_model {self.config.d_model}"
+                )
+        else:
+            assert idx is not None
+            B, T = idx.shape
+
         if T > self.config.block_size:
             raise ValueError(
                 f"Sequence length {T} exceeds block_size {self.config.block_size}"
             )
 
-        pos = torch.arange(0, T, device=idx.device, dtype=torch.long)
-        tok = self.wte(idx)
-        pos_e = self.wpe(pos)
+        if position_ids is None:
+            if idx is not None:
+                device = idx.device
+            else:
+                assert inputs_embeds is not None
+                device = inputs_embeds.device
+            pos = torch.arange(0, T, device=device, dtype=torch.long)
+            pos_e = self.wpe(pos).unsqueeze(0)
+        else:
+            if position_ids.shape[-1] != T:
+                raise ValueError(
+                    "position_ids length must match sequence length."
+                )
+            pos_e = self.wpe(position_ids)
+            if pos_e.dim() == 2:
+                pos_e = pos_e.unsqueeze(0)
+            if pos_e.shape[0] == 1 and B > 1:
+                pos_e = pos_e.expand(B, -1, -1)
+
+        tok = self.wte(idx) if idx is not None else inputs_embeds
         x = self.drop(tok + pos_e)
 
         attn_list: List[torch.Tensor] = []
+        present_key_values: List[Tuple[torch.Tensor, torch.Tensor]] = []
         for block in self.blocks:
-            x, aw = block(x, return_attn=return_attn)
+            block_idx = len(present_key_values)
+            past_kv = None
+            if past_key_values is not None and block_idx < len(past_key_values):
+                past_kv = past_key_values[block_idx]
+            x, aw, present = block(
+                x,
+                return_attn=return_attn,
+                use_cache=use_cache,
+                past_kv=past_kv,
+            )
             if aw is not None:
                 attn_list.append(aw)
+            if present is not None:
+                present_key_values.append(present)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
 
+        if return_attn and use_cache:
+            return logits, attn_list, present_key_values
         if return_attn:
             return logits, attn_list
+        if use_cache:
+            return logits, present_key_values
         return logits
 
     @torch.no_grad()

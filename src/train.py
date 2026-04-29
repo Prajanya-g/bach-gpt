@@ -13,6 +13,7 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.nn.functional as F
+import wandb
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
@@ -44,7 +45,9 @@ def _lr_lambda_factory(warmup_steps: int, total_steps: int):
 
 
 @torch.no_grad()
-def evaluate(model: GPT, val_loader: DataLoader, device: torch.device) -> float:
+def evaluate(
+    model: GPT, val_loader: DataLoader, device: torch.device
+) -> float:
     model.eval()
     total = 0.0
     n_tokens = 0
@@ -217,110 +220,157 @@ def train(args: argparse.Namespace) -> None:
     train_loss_count = 0
     last_val_loss: Optional[float] = None
 
+    wandb.init(
+        project="bach-gpt",
+        name="v2-25M-5k-files",
+        config={
+            "d_model": cfg.d_model,
+            "n_layers": cfg.n_layers,
+            "n_heads": cfg.n_heads,
+            "d_ff": cfg.d_ff,
+            "block_size": cfg.block_size,
+            "batch_size": args.batch_size,
+            "max_epochs": args.max_epochs,
+            "warmup_steps": args.warmup_steps,
+            "sample_dir": args.sample_dir or "sample_5k",
+        },
+    )
+
     model.train()
     t0 = time.perf_counter()
 
-    for epoch in range(args.max_epochs):
-        for x, y in train_loader:
-            x = x.to(device)
-            y = y.to(device)
+    try:
+        for epoch in range(args.max_epochs):
+            for x, y in train_loader:
+                x = x.to(device)
+                y = y.to(device)
 
-            logits = model(x)
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                y.reshape(-1),
-            )
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-
-            global_step += 1
-            train_loss_accum += loss.item()
-            train_loss_count += 1
-
-            lr = optimizer.param_groups[0]["lr"]
-
-            if global_step % args.train_log_every == 0:
-                avg_train = train_loss_accum / max(1, train_loss_count)
-                try:
-                    train_ppl = math.exp(avg_train)
-                except OverflowError:
-                    train_ppl = float("inf")
-                print(
-                    f"[train] step={global_step} epoch={epoch} "
-                    f"train_loss={avg_train:.4f} train_ppl={train_ppl:.2f} "
-                    f"lr={lr:.2e}"
-                )
-                append_csv_row(
-                    log_csv,
-                    fieldnames,
-                    {
-                        "step": global_step,
-                        "epoch": epoch,
-                        "lr": lr,
-                        "train_loss": f"{avg_train:.6f}",
-                        "val_loss": "" if last_val_loss is None else f"{last_val_loss:.6f}",
-                        "train_ppl": f"{train_ppl:.4f}",
-                        "val_ppl": (
-                            ""
-                            if last_val_loss is None
-                            else f"{math.exp(last_val_loss):.4f}"
-                        ),
-                    },
-                    write_header=False,
-                )
-                train_loss_accum = 0.0
-                train_loss_count = 0
-
-            if global_step % args.val_every == 0:
-                val_loss = evaluate(model, val_loader, device)
-                last_val_loss = val_loss
-                val_ppl = math.exp(val_loss)
-                print(
-                    f"[val] step={global_step} val_loss={val_loss:.4f} "
-                    f"val_ppl={val_ppl:.2f}"
-                )
-                append_csv_row(
-                    log_csv,
-                    fieldnames,
-                    {
-                        "step": global_step,
-                        "epoch": epoch,
-                        "lr": lr,
-                        "train_loss": "",
-                        "val_loss": f"{val_loss:.6f}",
-                        "train_ppl": "",
-                        "val_ppl": f"{val_ppl:.4f}",
-                    },
-                    write_header=False,
+                logits = model(x)
+                loss = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    y.reshape(-1),
                 )
 
-                if val_loss < best_val:
-                    best_val = val_loss
-                    save_best(best_path, model, val_loss, global_step, config_dict)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+                global_step += 1
+                train_loss_accum += loss.item()
+                train_loss_count += 1
+
+                lr = optimizer.param_groups[0]["lr"]
+
+                if global_step % args.train_log_every == 0:
+                    avg_train = train_loss_accum / max(1, train_loss_count)
+                    try:
+                        train_ppl = math.exp(avg_train)
+                    except OverflowError:
+                        train_ppl = float("inf")
                     print(
-                        f"[train] new best val_loss={val_loss:.4f} "
-                        f"→ {best_path}"
+                        f"[train] step={global_step} epoch={epoch} "
+                        f"train_loss={avg_train:.4f} train_ppl={train_ppl:.2f} "
+                        f"lr={lr:.2e}"
+                    )
+                    wandb.log(
+                        {
+                            "train/loss": avg_train,
+                            "train/ppl": train_ppl,
+                            "lr": lr,
+                        },
+                        step=global_step,
+                    )
+                    append_csv_row(
+                        log_csv,
+                        fieldnames,
+                        {
+                            "step": global_step,
+                            "epoch": epoch,
+                            "lr": lr,
+                            "train_loss": f"{avg_train:.6f}",
+                            "val_loss": (
+                                ""
+                                if last_val_loss is None
+                                else f"{last_val_loss:.6f}"
+                            ),
+                            "train_ppl": f"{train_ppl:.4f}",
+                            "val_ppl": (
+                                ""
+                                if last_val_loss is None
+                                else f"{math.exp(last_val_loss):.4f}"
+                            ),
+                        },
+                        write_header=False,
+                    )
+                    train_loss_accum = 0.0
+                    train_loss_count = 0
+
+                if global_step % args.val_every == 0:
+                    val_loss = evaluate(model, val_loader, device)
+                    last_val_loss = val_loss
+                    val_ppl = math.exp(val_loss)
+                    print(
+                        f"[val] step={global_step} val_loss={val_loss:.4f} "
+                        f"val_ppl={val_ppl:.2f}"
+                    )
+                    wandb.log(
+                        {
+                            "val/loss": val_loss,
+                            "val/ppl": val_ppl,
+                        },
+                        step=global_step,
+                    )
+                    append_csv_row(
+                        log_csv,
+                        fieldnames,
+                        {
+                            "step": global_step,
+                            "epoch": epoch,
+                            "lr": lr,
+                            "train_loss": "",
+                            "val_loss": f"{val_loss:.6f}",
+                            "train_ppl": "",
+                            "val_ppl": f"{val_ppl:.4f}",
+                        },
+                        write_header=False,
                     )
 
-            if global_step % args.checkpoint_every == 0:
-                ckpt_path = ckpt_dir / f"checkpoint_step_{global_step}.pt"
-                save_checkpoint(
-                    ckpt_path,
-                    model,
-                    optimizer,
-                    scheduler,
-                    global_step,
-                    epoch,
-                    config_dict,
-                )
-                print(f"[train] saved {ckpt_path}")
+                    if val_loss < best_val:
+                        best_val = val_loss
+                        save_best(
+                            best_path,
+                            model,
+                            val_loss,
+                            global_step,
+                            config_dict,
+                        )
+                        print(
+                            f"[train] new best val_loss={val_loss:.4f} "
+                            f"→ {best_path}"
+                        )
+
+                if global_step % args.checkpoint_every == 0:
+                    ckpt_path = ckpt_dir / f"checkpoint_step_{global_step}.pt"
+                    save_checkpoint(
+                        ckpt_path,
+                        model,
+                        optimizer,
+                        scheduler,
+                        global_step,
+                        epoch,
+                        config_dict,
+                    )
+                    print(f"[train] saved {ckpt_path}")
+    finally:
+        wandb.finish()
 
     elapsed = time.perf_counter() - t0
-    print(f"[train] finished in {elapsed / 60:.1f} min, best_val={best_val:.4f}")
+    print(
+        f"[train] finished in {elapsed / 60:.1f} min, "
+        f"best_val={best_val:.4f}"
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -339,7 +389,10 @@ def parse_args() -> argparse.Namespace:
         "--sample-dir",
         type=str,
         default="",
-        help="Override GigaMIDI sample directory (default: data/gigamidi/sample)",
+        help=(
+            "Override GigaMIDI sample directory "
+            "(default: data/gigamidi/sample)"
+        ),
     )
     p.add_argument(
         "--results-dir",

@@ -178,7 +178,7 @@ class MidiTextContrastiveModel(nn.Module):
 
         if self._last_hidden is None:
             raise RuntimeError("Failed to capture MIDI last hidden states.")
-        return self._last_hidden
+        return self.midi_encoder.ln_f(self._last_hidden)
 
     @staticmethod
     def _masked_mean_pool(

@@ -60,12 +60,6 @@ class CausalSelfAttention(nn.Module):
         self.attn_drop = nn.Dropout(dropout)
         self.resid_drop = nn.Dropout(dropout)
 
-        # [1, 1, block_size, block_size] boolean mask: 1 = allowed
-        mask = torch.tril(torch.ones(block_size, block_size, dtype=torch.bool))
-        self.register_buffer(
-            "causal_mask", mask.view(1, 1, block_size, block_size)
-        )
-
     def forward(
         self,
         x: torch.Tensor,

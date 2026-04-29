@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 import pretty_midi
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, get_worker_info
 
 from tokenizer import encode
 
@@ -63,6 +63,7 @@ class MidiCaptionDataset(Dataset):
         self.records = records
         self.is_train = is_train
         self.max_seq_len = max_seq_len
+        self._seed = seed
         self._rng = random.Random(seed)
         self._token_cache: Dict[int, Optional[List[int]]] = {}
         self._valid_indices: set[int] = set()
@@ -174,6 +175,15 @@ def _collate_caption_batch(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _seed_dataset_worker(worker_id: int) -> None:
+    info = get_worker_info()
+    if info is None:
+        return
+    ds = info.dataset
+    if isinstance(ds, MidiCaptionDataset):
+        ds._rng.seed(ds._seed + worker_id)
+
+
 def build_caption_dataloaders(
     jsonl_path: Path | str,
     max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
@@ -234,6 +244,7 @@ def build_caption_dataloaders(
         num_workers=num_workers,
         pin_memory=pin_memory,
         collate_fn=_collate_caption_batch,
+        worker_init_fn=_seed_dataset_worker,
     )
     val_loader = DataLoader(
         val_ds,
@@ -243,6 +254,7 @@ def build_caption_dataloaders(
         num_workers=num_workers,
         pin_memory=pin_memory,
         collate_fn=_collate_caption_batch,
+        worker_init_fn=_seed_dataset_worker,
     )
 
     stats = CaptionDatasetStats(

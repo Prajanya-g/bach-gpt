@@ -146,7 +146,11 @@ def _collect_layer_activations(
     ids: List[int],
     device: torch.device,
 ) -> torch.Tensor:
-    """Return tensor (L, T, D) of block output activations for one sequence."""
+    """Return tensor (L+1, T, D): embedding baseline + block outputs.
+
+    Index 0 corresponds to layer -1 (raw token embeddings).
+    Indices 1..L correspond to transformer block outputs for layers 0..L-1.
+    """
     activations: Dict[int, torch.Tensor] = {}
     hooks = []
 
@@ -163,12 +167,13 @@ def _collect_layer_activations(
 
     try:
         x = torch.tensor([ids], dtype=torch.long, device=device)
+        emb = model.wte(x).detach()[0].cpu()
         _ = model(x)
     finally:
         for h in hooks:
             h.remove()
 
-    layer_tensors = [
+    layer_tensors = [emb] + [
         activations[i][0].cpu() for i in range(model.config.n_layers)
     ]
     return torch.stack(layer_tensors, dim=0)
@@ -223,13 +228,15 @@ def _plot_probe_lines(
     out_path: Path,
 ) -> None:
     fig, ax = plt.subplots(figsize=(7.5, 4.5))
-    n_layers = len(next(iter(results.values())))
-    xs = list(range(n_layers))
+    n_levels = len(next(iter(results.values())))
+    xs = list(range(n_levels))
+    layer_labels = [-1] + list(range(n_levels - 1))
     for name, vals in results.items():
         ax.plot(xs, vals, marker="o", linewidth=2, label=name)
     ax.set_xlabel("layer")
     ax.set_ylabel("validation accuracy")
     ax.set_xticks(xs)
+    ax.set_xticklabels([str(x) for x in layer_labels])
     ax.set_title("Linear probe accuracy by layer")
     ax.grid(alpha=0.25)
     ax.legend()
@@ -244,21 +251,25 @@ def _write_summary_md(
     results: Dict[str, List[float]],
     baselines: Dict[str, float],
 ) -> None:
+    n_levels = len(next(iter(results.values())))
+    layer_labels = [-1] + list(range(n_levels - 1))
+    layer_cols = " | ".join([f"layer_{x}" for x in layer_labels])
+    align_cols = "|".join(["---:"] * len(layer_labels))
     rows = [
         "# Linear probe summary",
         "",
-        "| target | random_baseline | layer_0 | layer_1 | "
-        "layer_2 | layer_3 | best_layer | best_acc |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| target | random_baseline | "
+        f"{layer_cols} | best_layer | best_acc |",
+        f"|---|---:|{align_cols}|---:|---:|",
     ]
     for target, vals in results.items():
-        best_layer = int(np.argmax(vals))
+        best_idx = int(np.argmax(vals))
         best_acc = float(np.max(vals))
-        padded = vals + [np.nan] * max(0, 4 - len(vals))
+        best_layer = layer_labels[best_idx]
+        per_layer = " | ".join(f"{v:.3f}" for v in vals)
         rows.append(
-            f"| {target} | {baselines[target]:.3f} | "
-            f"{padded[0]:.3f} | {padded[1]:.3f} | {padded[2]:.3f} | "
-            f"{padded[3]:.3f} | {best_layer} | {best_acc:.3f} |"
+            f"| {target} | {baselines[target]:.3f} | {per_layer} | "
+            f"{best_layer} | {best_acc:.3f} |"
         )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(rows))
@@ -315,8 +326,8 @@ def main() -> None:
             "No JSB chorales loaded; check music21 install/dataset."
         )
 
-    n_layers = cfg.n_layers
-    X_layers: List[List[np.ndarray]] = [[] for _ in range(n_layers)]
+    n_levels = cfg.n_layers + 1
+    X_layers: List[List[np.ndarray]] = [[] for _ in range(n_levels)]
     labels_all: Dict[str, List[np.ndarray]] = {
         "beat_position": [],
         "pitch_class": [],
@@ -330,9 +341,9 @@ def main() -> None:
             ids=ids[:seq_len],
             device=device,
         )
-        # acts shape: (L, T, D)
+        # acts shape: (L+1, T, D), where index 0 is layer -1 embedding.
         labels = _build_labels(ids[:seq_len])
-        for layer_idx in range(n_layers):
+        for layer_idx in range(n_levels):
             X_layers[layer_idx].append(acts[layer_idx].numpy())
         for k in labels_all:
             labels_all[k].append(labels[k])
@@ -365,6 +376,7 @@ def main() -> None:
     )
 
     print(f"[probe_linear] chorales_used={len(seqs)} seq_len={seq_len}")
+    print("[probe_linear] layer index convention: -1=embedding, 0..N-1=blocks")
     print(f"[probe_linear] plot -> {args.plot_out}")
     print(f"[probe_linear] summary -> {args.summary_out}")
     for target, vals in results.items():

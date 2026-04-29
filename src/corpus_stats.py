@@ -27,7 +27,7 @@ import sys
 import tempfile
 from collections import Counter
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -63,122 +63,6 @@ RES_DIR = ROOT / "results"
 DATA_DIR = ROOT / "data"
 FIG_DIR.mkdir(exist_ok=True)
 RES_DIR.mkdir(exist_ok=True)
-
-
-def _gigamidi_zip_candidates() -> List[Path]:
-    """v1.1 nested zip (local unzip) or flat zip (some Hub layouts)."""
-    root = DATA_DIR / GIGAMIDI_ROOT
-    return [
-        root / GIGAMIDI_TRAINING_ZIP_REL,
-        root / "all-instruments-with-drums.zip",
-    ]
-
-
-def _gigamidi_all_instruments_dir() -> Optional[Path]:
-    """Directory of training MIDIs: nested v1.1, Hub flat under root, or fuzzy name."""
-    root = DATA_DIR / GIGAMIDI_ROOT
-    if not root.is_dir():
-        return None
-    candidates = [
-        root / "training-V1.1-80%" / "all-instruments-with-drums",
-        root / "all-instruments-with-drums",
-    ]
-    for c in candidates:
-        if c.is_dir():
-            return c
-    for child in root.iterdir():
-        if child.is_dir() and child.name.strip() == "all-instruments-with-drums":
-            return child
-    return None
-
-
-def _is_midi_suffix(path: Path) -> bool:
-    return path.is_file() and path.suffix.lower() in (".mid", ".midi")
-
-
-def _collect_midi_paths(source: Path) -> List[Path]:
-    return [
-        p
-        for p in source.rglob("*")
-        if _is_midi_suffix(p) and not p.name.startswith(".")
-    ]
-
-
-def _count_midi_zip_entries(zp: Path) -> int:
-    import zipfile
-
-    try:
-        with zipfile.ZipFile(zp) as z:
-            return sum(
-                1
-                for nm in z.namelist()
-                if Path(nm).suffix.lower() in (".mid", ".midi")
-                and "__MACOSX" not in nm
-            )
-    except (zipfile.BadZipFile, OSError):
-        return 0
-
-
-def _iter_shard_zips(source_dir: Path) -> List[Path]:
-    return sorted(
-        p
-        for p in source_dir.rglob("*.zip")
-        if "__MACOSX" not in p.parts
-    )
-
-
-def _ensure_gigamidi_from_shard_zips(
-    source_dir: Path, n: int, sample_dir: Path
-) -> int:
-    """Sample MIDIs from nested .zip shards (typical Hugging Face tree)."""
-    import shutil
-    import zipfile
-
-    zips = _iter_shard_zips(source_dir)
-    if not zips:
-        return 0
-
-    total_files = sum(_count_midi_zip_entries(zp) for zp in zips)
-    if total_files == 0:
-        return 0
-
-    existing = list(sample_dir.glob("*.mid")) + list(
-        sample_dir.glob("*.midi")
-    )
-    if len(existing) >= n:
-        return total_files
-
-    sample_dir.mkdir(parents=True, exist_ok=True)
-    rng = random.Random(RNG_SEED)
-    needed = n - len(existing)
-    copied = 0
-    rng.shuffle(zips)
-    for zp in zips:
-        if copied >= needed:
-            break
-        try:
-            with zipfile.ZipFile(zp) as z:
-                members = [
-                    m
-                    for m in z.namelist()
-                    if Path(m).suffix.lower() in (".mid", ".midi")
-                    and "__MACOSX" not in m
-                ]
-                if not members:
-                    continue
-                rng.shuffle(members)
-                for nm in members:
-                    if copied >= needed:
-                        break
-                    dest = sample_dir / Path(nm).name
-                    if dest.exists():
-                        continue
-                    with z.open(nm) as src, open(dest, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
-                    copied += 1
-        except (zipfile.BadZipFile, OSError):
-            continue
-    return total_files
 
 
 # --- Corpus loaders -----------------------------------------------------------
@@ -273,80 +157,42 @@ def load_maestro(n: int) -> List[Tuple[str, pretty_midi.PrettyMIDI]]:
 
 
 def _ensure_gigamidi_sample(n: int, sample_dir: Path) -> int:
-    """Ensure the GigaMIDI sample directory contains at least n MIDI files.
+    """Ensure the GigaMIDI sample directory contains at least n MIDI files,
+    extracting them from the training-V1.1-80%/all-instruments-with-drums.zip
+    if needed. Returns the total number of MIDI files in the source zip
+    (used for full-corpus projection)."""
+    import zipfile, shutil
 
-    Source (first match): training zip (nested or flat), else extracted
-    all-instruments-with-drums/ tree (Hub snapshot or v1.1 unzip).
-
-    Returns total MIDI count in the source (zip entries or files on disk).
-    """
-    import shutil
-    import zipfile
-
-    zip_path = next((p for p in _gigamidi_zip_candidates() if p.exists()), None)
-
-    if zip_path is not None:
-        with zipfile.ZipFile(zip_path) as z:
-            all_midi = [
-                nm
-                for nm in z.namelist()
-                if Path(nm).suffix.lower() in (".mid", ".midi")
-                and "__MACOSX" not in nm
-            ]
-            total_files = len(all_midi)
-
-            existing = list(sample_dir.glob("*.mid")) + list(
-                sample_dir.glob("*.midi")
-            )
-            if len(existing) >= n:
-                return total_files
-
-            sample_dir.mkdir(parents=True, exist_ok=True)
-            rng = random.Random(RNG_SEED)
-            rng.shuffle(all_midi)
-            needed = n - len(existing)
-            extracted = 0
-            for nm in all_midi:
-                if extracted >= needed:
-                    break
-                fname = Path(nm).name
-                dest = sample_dir / fname
-                if dest.exists():
-                    continue
-                with z.open(nm) as src, open(dest, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
-                extracted += 1
-        return total_files
-
-    source_dir = _gigamidi_all_instruments_dir()
-    if source_dir is None:
+    zip_path = DATA_DIR / GIGAMIDI_ROOT / GIGAMIDI_TRAINING_ZIP_REL
+    if not zip_path.exists():
         return 0
 
-    all_paths = _collect_midi_paths(source_dir)
-    if all_paths:
-        total_files = len(all_paths)
-        existing = list(sample_dir.glob("*.mid")) + list(
-            sample_dir.glob("*.midi")
-        )
+    with zipfile.ZipFile(zip_path) as z:
+        all_midi = [nm for nm in z.namelist()
+                    if (nm.endswith(".mid") or nm.endswith(".midi"))
+                    and not nm.startswith("__MACOSX/")]
+        total_files = len(all_midi)
+
+        existing = [p for p in sample_dir.glob("*.mid")] + [p for p in sample_dir.glob("*.midi")]
         if len(existing) >= n:
             return total_files
 
         sample_dir.mkdir(parents=True, exist_ok=True)
         rng = random.Random(RNG_SEED)
-        rng.shuffle(all_paths)
+        rng.shuffle(all_midi)
         needed = n - len(existing)
-        copied = 0
-        for src_path in all_paths:
-            if copied >= needed:
+        extracted = 0
+        for nm in all_midi:
+            if extracted >= needed:
                 break
-            dest = sample_dir / src_path.name
+            fname = Path(nm).name
+            dest = sample_dir / fname
             if dest.exists():
                 continue
-            shutil.copy2(src_path, dest)
-            copied += 1
-        return total_files
-
-    return _ensure_gigamidi_from_shard_zips(source_dir, n, sample_dir)
+            with z.open(nm) as src, open(dest, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            extracted += 1
+    return total_files
 
 
 def load_gigamidi(n: int) -> Tuple[List[Tuple[str, pretty_midi.PrettyMIDI]], int]:
@@ -360,12 +206,8 @@ def load_gigamidi(n: int) -> Tuple[List[Tuple[str, pretty_midi.PrettyMIDI]], int
     sample_dir = DATA_DIR / GIGAMIDI_SAMPLE_SUBDIR
     total_files = _ensure_gigamidi_sample(n, sample_dir)
     if total_files == 0:
-        tried = ", ".join(str(p) for p in _gigamidi_zip_candidates())
-        print(
-            "[corpus_stats] GigaMIDI training source not found. "
-            f"Tried zips: {tried}; "
-            f"or directory {_gigamidi_all_instruments_dir() or '<none>'}"
-        )
+        print(f"[corpus_stats] GigaMIDI zip not found at "
+              f"{DATA_DIR / GIGAMIDI_ROOT / GIGAMIDI_TRAINING_ZIP_REL}")
         return [], 0
 
     midis = sorted(sample_dir.glob("*.mid")) + sorted(sample_dir.glob("*.midi"))

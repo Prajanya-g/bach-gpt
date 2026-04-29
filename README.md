@@ -1,79 +1,78 @@
 # bach-gpt
 
-Mechanistic interpretability of a small GPT-style transformer trained on symbolic music (MIDI).
+Mechanistic interpretability experiments on a small GPT-style transformer trained on symbolic music (MIDI tokens).
 
-## Layout
+## What this repo contains
 
-```
+- MIDI tokenizer with a fixed symbolic vocabulary and round-trip checks.
+- Data pipeline for building token chunks from sampled GigaMIDI files.
+- GPT training + checkpointing + CSV logging + Weights and Biases logging.
+- MIDI generation from checkpoints (random, JSB, or custom MIDI prompts).
+- Probing scripts for linear probes, attention analysis, and phrase completion.
+
+## Project layout
+
+```text
 bach-gpt/
 ├── src/
-│   ├── tokenizer.py       # 167-token vocab + encode/decode + round-trip test
-│   ├── corpus_stats.py    # JSB + GigaMIDI stats, figures, markdown report
-│   ├── dataset.py         # MIDI → chunked token tensors, train/val DataLoaders
-│   ├── model.py           # minimal GPT (manual causal attention, tied embeddings)
-│   ├── train.py           # training loop + cosine LR + checkpoints + CSV logs
-│   ├── generate.py        # checkpoint sampling (random/jsb/custom MIDI prompts)
-│   ├── extract_gigamidi_sample.py  # parquet -> sampled .mid files
-│   └── download.py        # gated Hugging Face snapshot download helper
-├── data/                  # NOT COMMITTED — see "Datasets" below
-│   ├── Final_GigaMIDI_V1.1_Final/   # GigaMIDI v1.1 splits (zips + optional unzip)
-│   └── gigamidi/sample/             # 100-file sample extracted from the training zip
-├── figures/               # PNGs written by corpus_stats.py
-├── results/
-│   └── corpus_stats.md    # markdown summary written by corpus_stats.py
-├── checkin.md             # project check-in (markdown)
-├── checkin.docx           # project check-in (Word)
+│   ├── tokenizer.py
+│   ├── corpus_stats.py
+│   ├── dataset.py
+│   ├── model.py
+│   ├── train.py
+│   ├── generate.py
+│   ├── download.py
+│   ├── extract_gigamidi_sample.py
+│   ├── probe_linear.py
+│   ├── probe_attention.py
+│   └── probe_completion.py
+├── data/            # not committed
+├── figures/         # plots produced by stats/probing scripts
+├── results/         # markdown summaries, logs, checkpoints
 ├── requirements.txt
 └── README.md
 ```
 
-## Datasets (not committed)
+## Requirements
 
-The `data/` directory is in `.gitignore`. Download the corpora locally before running the pipeline.
+- Python 3.10+ (because `music21>=9.0` requires it).
+- Dependencies from `requirements.txt`.
+- PyTorch installed separately for your platform.
 
-- **GigaMIDI v1.1/v2.0** (pretraining): [Metacreation/GigaMIDI](https://huggingface.co/datasets/Metacreation/GigaMIDI) on Hugging Face (gated — log in and accept terms).
-  - **Zip layout path** (older workflow): after unzipping `training-V1.1-80%.zip`, you should have `data/Final_GigaMIDI_V1.1_Final/training-V1.1-80%/all-instruments-with-drums.zip`, and `corpus_stats.py` can sample from that zip.
-  - **Parquet layout path** (HF snapshot workflow): data lives in `data/Final_GigaMIDI_V1.1_Final/all-instruments-with-drums/train.parquet` (no raw `.mid` files on disk). Use `src/extract_gigamidi_sample.py` to write sampled `.mid` files into `data/gigamidi/sample/`.
-- **JSB Chorales** (probing): no download — loaded from `music21.corpus.chorales.Iterator()` the first time `corpus_stats.py` runs.
-
-## Setup
+Setup:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-For `src/dataset.py`, `src/model.py`, `src/train.py`, and `src/generate.py`, install PyTorch for your platform (not listed in `requirements.txt`):
-
-```bash
 pip install torch
 ```
 
-([PyTorch install selector](https://pytorch.org/get-started/locally/) if you need a specific CUDA build.)
+For CUDA-specific wheels, use the [PyTorch install selector](https://pytorch.org/get-started/locally/).
 
-### Python version note
+## Datasets (not committed)
 
-- `music21>=9.0` requires Python 3.10+.
-- On Python 3.9 environments (common on HPC), JSB-related features may need an older `music21`, but the GigaMIDI parquet -> sample -> train path works without JSB.
+`data/` is gitignored. You need local dataset files before training.
 
-## Run
+- **GigaMIDI** (pretraining corpus, gated): [Metacreation/GigaMIDI](https://huggingface.co/datasets/Metacreation/GigaMIDI)
+- **JSB Chorales** (probing/statistics): loaded through `music21` corpus APIs (no manual download in this repo).
+
+### Download GigaMIDI from Hugging Face
+
+After accepting dataset terms and creating a read token:
 
 ```bash
-python3 src/tokenizer.py       # smoke-test the tokenizer
-python3 src/corpus_stats.py    # JSB + GigaMIDI stats → figures/ + results/
-python3 src/dataset.py         # build train/val loaders from data/gigamidi/sample/ (needs torch)
-python3 src/train.py           # train model, save checkpoints, write training_log.csv
-python3 src/generate.py --checkpoint results/checkpoints/best_model.pt --prompt random --out results/generated.mid
+export HF_TOKEN=hf_...
+python3 src/download.py
 ```
 
-On first run, `corpus_stats.py` extracts 100 random MIDI files from the GigaMIDI training zip into `data/gigamidi/sample/` and caches them. Delete that folder to force a fresh sample.
+This downloads into `data/Final_GigaMIDI_V1.1_Final/` by default.
 
-`dataset.py` encodes those MIDIs, concatenates with `EOS` between pieces, chunks into fixed windows, does a 90/10 train/val split on chunks, and prints basic sanity checks (vocab bounds, token counts, random decode preview).
+## Build a local training sample
 
-## HPC parquet workflow (recommended)
+### Recommended (parquet workflow)
 
-If your Hugging Face download produced parquet files (e.g. `all-instruments-with-drums/train.parquet`), run:
+If your snapshot contains parquet files (for example `all-instruments-with-drums/train.parquet`):
 
 ```bash
 python3 src/extract_gigamidi_sample.py \
@@ -83,16 +82,49 @@ python3 src/extract_gigamidi_sample.py \
   --seed 17
 ```
 
-Then train as usual:
+### Zip workflow
+
+If you have `training-V1.1-80%/all-instruments-with-drums.zip` under `data/Final_GigaMIDI_V1.1_Final/`, `src/corpus_stats.py` can auto-extract a 100-file sample into `data/gigamidi/sample/` on first run.
+
+## Typical run sequence
 
 ```bash
+python3 src/tokenizer.py
+python3 src/corpus_stats.py
 python3 src/dataset.py
 python3 src/train.py --max-epochs 10 --batch-size 32 --block-size 512
-python3 src/generate.py --checkpoint results/checkpoints/best_model.pt --prompt random --out results/generated.mid
+python3 src/generate.py \
+  --checkpoint results/checkpoints/best_model.pt \
+  --prompt random \
+  --out results/generated.mid
 ```
 
-## Status
+Outputs:
 
-Check-in (2026-04-22): tokenizer + round-trip test + GigaMIDI/JSB statistics pipeline; pretraining corpus is GigaMIDI v1.1.
+- `results/training_log.csv`
+- `results/checkpoints/*.pt`
+- `results/generated.mid` (+ continuation-only MIDI)
+- figures and markdown summaries in `figures/` and `results/`
 
-Update (2026-04-28): training stack now includes `dataset.py`, `model.py`, `train.py`, and `generate.py`, plus parquet sample extraction via `extract_gigamidi_sample.py`.
+## Training notes
+
+- `src/train.py` logs to Weights and Biases (`wandb`) by default.
+- If you do not want cloud logging, run with offline mode:
+
+```bash
+WANDB_MODE=offline python3 src/train.py
+```
+
+- Device is auto-selected (`cuda` -> `mps` -> `cpu`).
+
+## Probing and analysis scripts
+
+After training (or with an existing checkpoint):
+
+```bash
+python3 src/probe_linear.py --checkpoint results/checkpoints/best_model.pt
+python3 src/probe_attention.py --checkpoint results/checkpoints/best_model.pt
+python3 src/probe_completion.py --checkpoint results/checkpoints/best_model.pt
+```
+
+These write figures to `figures/` and markdown summaries to `results/`.

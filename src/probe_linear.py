@@ -179,6 +179,11 @@ def _probe_one_target(
     y: np.ndarray,
     seed: int,
 ) -> List[float]:
+    unique_classes = np.unique(y)
+    if unique_classes.size < 2:
+        # Degenerate target on this sample split; all predictions are trivial.
+        return [1.0 for _ in X_by_layer]
+
     idx = np.arange(len(y))
     train_idx, val_idx = train_test_split(
         idx,
@@ -194,11 +199,18 @@ def _probe_one_target(
     for X in X_by_layer:
         X_train = X[train_idx]
         X_val = X[val_idx]
+
+        train_classes = np.unique(y_train)
+        if train_classes.size < 2:
+            majority = train_classes[0]
+            pred = np.full_like(y_val, fill_value=majority)
+            scores.append(float(accuracy_score(y_val, pred)))
+            continue
+
         clf = LogisticRegression(
             max_iter=1000,
             random_state=seed,
             solver="lbfgs",
-            multi_class="auto",
         )
         clf.fit(X_train, y_train)
         pred = clf.predict(X_val)

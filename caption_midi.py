@@ -20,6 +20,7 @@ Output (one JSON per line):
 
 import os, json, random, argparse
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pretty_midi
@@ -52,7 +53,7 @@ def program_to_family(p: int) -> str:
 # 2.  FEATURE EXTRACTION  (14 features)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def extract_features(midi_path: str, skip_music21: bool = False) -> dict | None:
+def extract_features(midi_path: str, skip_music21: bool = False) -> Optional[dict]:
     try:
         pm = pretty_midi.PrettyMIDI(midi_path)
     except Exception:
@@ -277,7 +278,7 @@ def describe_instruments(instruments: list, has_drum: bool) -> str:
 # 4.  GENRE HINTING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def infer_genre(families: set, bpm: float, is_minor: bool, has_drum: bool) -> str | None:
+def infer_genre(families: set, bpm: float, is_minor: bool, has_drum: bool) -> Optional[str]:
     fast = bpm >= 120
     slow = bpm < 90
 

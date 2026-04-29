@@ -230,7 +230,7 @@ def run_transformers(prompts: list[str], model_name: str,
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        max_new_tokens=160,
+        max_new_tokens=200,
         do_sample=True,
         temperature=0.85,
         top_p=0.92,
@@ -252,18 +252,27 @@ def run_transformers(prompts: list[str], model_name: str,
     for i in tqdm(range(0, len(chats), batch_size), desc="transformers batches"):
         batch = chats[i : i + batch_size]
         outputs = pipe(batch)
-        for prompt_text, item in zip(batch, outputs):
-            # pipeline returns list of dicts; grab generated text after prompt
+        for item, prompt in zip(outputs, batch):
             full = item[0]["generated_text"]
-            # strip everything up to and including the assistant turn marker
-            if "<|assistant|>" in full:
-                text = full.split("<|assistant|>")[-1].strip()
-            elif "Description:" in full:
-                text = full.split("Description:")[-1].strip()
-            else:
-                # Fallback: remove this example's prompt prefix.
-                text = full[len(prompt_text):].strip()
-            results.append(text.split("\n\n")[0].strip())   # first paragraph only
+            # pipeline returns input+output — strip the input prompt
+            if isinstance(full, str):
+                # find last assistant marker
+                for marker in [
+                    "<|im_start|>assistant\n",
+                    "<|im_start|>assistant",
+                    "<|assistant|>",
+                    "Description:",
+                ]:
+                    if marker in full:
+                        full = full.split(marker)[-1].strip()
+                        break
+                else:
+                    # fallback — strip the prompt itself
+                    full = full[len(prompt):].strip()
+            # take first paragraph only, strip any trailing special tokens
+            full = full.split("<|im_end|>")[0].strip()
+            full = full.split("<|im_start|>")[0].strip()
+            results.append(full.split("\n\n")[0].strip())
 
     return results
 

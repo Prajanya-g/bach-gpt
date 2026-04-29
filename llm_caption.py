@@ -218,6 +218,7 @@ def run_transformers(prompts: list[str], model_name: str,
     ) if quantize else None
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.padding_side = "left"
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=quant_cfg,
@@ -231,6 +232,7 @@ def run_transformers(prompts: list[str], model_name: str,
         model=model,
         tokenizer=tokenizer,
         max_new_tokens=200,
+        return_full_text=True,
         do_sample=True,
         temperature=0.85,
         top_p=0.92,

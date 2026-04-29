@@ -118,14 +118,17 @@ def append_csv_row(
         w.writerow(row)
 
 
+def _pick_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 def train(args: argparse.Namespace) -> None:
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.backends.mps.is_available()
-        else "cpu"
-    )
+    device = _pick_device()
     print(f"[train] device={device}")
 
     torch.manual_seed(args.seed)

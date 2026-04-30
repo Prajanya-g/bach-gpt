@@ -399,6 +399,11 @@ No Phase 2 contrastive loss is used in Phase 3.
 - Epochs: default `20` (works for 15–20 target)
 - Batch size: default `64` (32 is supported)
 - Dataset: same as Phase 2 (`captions_llm.jsonl`, same tokenizer/crops)
+- Context length constraint:
+  - Prefix tokens are prepended before MIDI tokens, so use
+    `max_seq_len = block_size - n_prefix_tokens`.
+  - Example with defaults (`block_size=512`, `n_prefix_tokens=8`):
+    set `--max-seq-len 504` for Phase 3 runs.
 
 ### Phase 3 metrics and checks
 

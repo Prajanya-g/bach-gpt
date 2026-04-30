@@ -194,9 +194,145 @@ pass "Phase 1b"
 COMPOUND_CKPT="results/test_compound/checkpoints_compound/compound_best.pt"
 [ -f "$COMPOUND_CKPT" ] || fail "compound checkpoint not found at $COMPOUND_CKPT"
 
+# -- Phase 2: compound contrastive smoke ----------------------------------------
+echo ""
+echo "========================================"
+echo "PHASE 2 — Compound contrastive smoke"
+echo "========================================"
+
+python3 << 'PYEOF'
+import json
+import random
+import sys
+from pathlib import Path
+
+import pretty_midi
+import torch
+
+sys.path.insert(0, "src")
+from compound import SENTINELS, STEP_PAD, encode_compound
+from compound_model import CompoundGPT, default_compound_config
+from contrastive_model import CompoundMidiTextContrastiveModel
+
+device = (
+    torch.device("cuda")
+    if torch.cuda.is_available()
+    else (
+        torch.device("mps")
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+        else torch.device("cpu")
+    )
+)
+print(f"[compound-contrastive] device={device}")
+
+cfg = default_compound_config()
+cfg.block_size = 512
+midi_encoder = CompoundGPT(cfg).to(device)
+
+ckpt = torch.load(
+    "results/test_compound/checkpoints_compound/compound_best.pt",
+    map_location=device,
+)
+midi_encoder.load_state_dict(ckpt["model_state_dict"], strict=False)
+midi_encoder.eval()
+
+model = CompoundMidiTextContrastiveModel(
+    midi_compound_gpt=midi_encoder,
+    device=device,
+)
+model.train()
+
+records = []
+with open("data/midicaps_100.jsonl", "r") as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            records.append(json.loads(line))
+if not records:
+    raise RuntimeError("No records found in data/midicaps_100.jsonl")
+
+random.seed(17)
+random.shuffle(records)
+
+batch_size = 8
+max_seq_len = 256
+compound_batches = []
+captions_batches = []
+cur_steps = []
+cur_caps = []
+for r in records:
+    path = r.get("path") or r.get("midi_path") or r.get("midi")
+    cap = (r.get("caption") or r.get("caption_template") or "").strip()
+    if not path or not cap:
+        continue
+    try:
+        pm = pretty_midi.PrettyMIDI(path)
+        steps = encode_compound(pm)
+    except Exception:
+        continue
+    if not steps:
+        continue
+
+    trimmed = steps[:max_seq_len]
+    pad_step = list(SENTINELS)
+    pad_step[0] = STEP_PAD
+    if len(trimmed) < max_seq_len:
+        trimmed = trimmed + [pad_step] * (max_seq_len - len(trimmed))
+
+    cur_steps.append(trimmed)
+    cur_caps.append(cap)
+    if len(cur_steps) == batch_size:
+        compound_batches.append(torch.tensor(cur_steps, dtype=torch.long))
+        captions_batches.append(list(cur_caps))
+        cur_steps, cur_caps = [], []
+    if len(compound_batches) >= 4:
+        break
+
+if not compound_batches:
+    raise RuntimeError("Could not build any valid compound-caption batches.")
+
+opt = torch.optim.AdamW(model.trainable_parameters(), lr=1e-4, weight_decay=0.01)
+
+for step_idx, (compound_input, captions) in enumerate(
+    zip(compound_batches, captions_batches), start=1
+):
+    compound_input = compound_input.to(device)
+    opt.zero_grad(set_to_none=True)
+    out = model(compound_input=compound_input, captions=captions)
+    loss = out["loss"]
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step()
+    print(
+        f"[compound-contrastive] step={step_idx} "
+        f"loss={loss.item():.4f} "
+        f"acc=({out['acc_midi_to_text'].item():.3f},{out['acc_text_to_midi'].item():.3f})"
+    )
+
+out_dir = Path("results/test_compound/checkpoints_contrastive_compound")
+out_dir.mkdir(parents=True, exist_ok=True)
+out_ckpt = out_dir / "clap_compound_smoke.pt"
+torch.save(
+    {
+        "model_state_dict": model.state_dict(),
+        "steps_ran": len(compound_batches),
+        "max_seq_len": max_seq_len,
+    },
+    out_ckpt,
+)
+print(f"[compound-contrastive] checkpoint -> {out_ckpt}")
+PYEOF
+
+[ $? -eq 0 ] || fail "Phase 2"
+pass "Phase 2"
+
+COMPOUND_CLAP_CKPT="results/test_compound/checkpoints_contrastive_compound/clap_compound_smoke.pt"
+[ -f "$COMPOUND_CLAP_CKPT" ] || fail "compound contrastive checkpoint not found at $COMPOUND_CLAP_CKPT"
+
 echo ""
 echo "========================================"
 echo "COMPOUND PIPELINE TEST PASSED"
 echo "Finished: $(date)"
 echo "========================================"
 echo "Checkpoint: $COMPOUND_CKPT"
+echo "Compound contrastive checkpoint: $COMPOUND_CLAP_CKPT"

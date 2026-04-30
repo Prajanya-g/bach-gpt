@@ -208,12 +208,9 @@ def evaluate(
     return {"loss": loss_sum / n_batches, "r1_m2t": r1_m2t, "r1_t2m": r1_t2m}
 
 
-def _load_compound_gpt(
-    ckpt_path: Path, device: torch.device, block_size: int
-) -> CompoundGPT:
+def _load_compound_gpt(ckpt_path: Path, device: torch.device) -> CompoundGPT:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     cfg = default_compound_config()
-    cfg.block_size = block_size
     raw_cfg = ckpt.get("config") if isinstance(ckpt, dict) else None
     if isinstance(raw_cfg, dict):
         for k in CompoundGPTConfig.__dataclass_fields__.keys():
@@ -276,7 +273,6 @@ def train(args: argparse.Namespace) -> None:
     midi_encoder = _load_compound_gpt(
         ckpt_path=Path(args.compound_checkpoint),
         device=device,
-        block_size=args.max_seq_len,
     )
     model = CompoundMidiTextContrastiveModel(
         midi_compound_gpt=midi_encoder,

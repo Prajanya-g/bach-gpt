@@ -73,7 +73,10 @@ echo "PHASE 1a — Compound tokenizer + dataloader smoke"
 echo "========================================"
 
 python3 << 'PYEOF'
+import sys
 from pathlib import Path
+
+sys.path.insert(0, "src")
 from compound_dataset import build_compound_dataloaders
 
 train_loader, val_loader, stats = build_compound_dataloaders(
@@ -107,8 +110,11 @@ echo "PHASE 1b — Compound GPT short train (100 files)"
 echo "========================================"
 
 python3 << 'PYEOF'
+import sys
 from pathlib import Path
 import torch
+
+sys.path.insert(0, "src")
 from compound_dataset import build_compound_dataloaders
 from compound_model import CompoundGPT, default_compound_config, compound_loss
 

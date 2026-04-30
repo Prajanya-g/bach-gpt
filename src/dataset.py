@@ -19,12 +19,23 @@ import pretty_midi
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from bpe import (
+    Merge,
+    apply_bpe,
+    effective_vocab_size,
+    load as load_bpe_merges,
+    unapply_bpe,
+)
 from tokenizer import EOS, ID2TOKEN, VOCAB_SIZE, decode, encode
 
 DEFAULT_BLOCK_SIZE = 512
 DEFAULT_BATCH_SIZE = 32
 DEFAULT_SPLIT_RATIO = 0.9
 DEFAULT_SEED = 17
+
+DEFAULT_BPE_MERGES_PATH = (
+    Path(__file__).resolve().parent.parent / "data" / "bpe" / "merges.json"
+)
 
 
 @dataclass
@@ -37,6 +48,9 @@ class DatasetStats:
     n_chunks_total: int
     n_train_chunks: int
     n_val_chunks: int
+    n_bpe_merges: int
+    vocab_size: int
+    n_base_tokens_total: int
 
 
 class TokenChunkDataset(Dataset):
@@ -138,8 +152,18 @@ def build_dataloaders(
     batch_size: int = DEFAULT_BATCH_SIZE,
     split_ratio: float = DEFAULT_SPLIT_RATIO,
     seed: int = DEFAULT_SEED,
+    bpe_merges_path: Path | None = DEFAULT_BPE_MERGES_PATH,
+    bpe_dropout: float = 0.0,
 ) -> tuple[DataLoader, DataLoader, DatasetStats]:
-    """Build train/val DataLoaders from local GigaMIDI sample files."""
+    """Build train/val DataLoaders from local GigaMIDI sample files.
+
+    If a BPE merges file exists at ``bpe_merges_path``, it is loaded and
+    applied to each encoded sequence before chunking. Pass ``None`` to
+    skip BPE entirely. Setting ``bpe_dropout > 0`` enables BPE-dropout
+    regularization (Provilkov et al. 2020); rebuild loaders each epoch
+    to expose the model to fresh segmentations.
+    """
+    import random as _random
     if sample_dir is None:
         root = Path(__file__).resolve().parent.parent
         sample_dir = root / "data" / "gigamidi" / "sample"
@@ -152,14 +176,26 @@ def build_dataloaders(
         + sorted(sample_dir.rglob("*.midi"))
     )
     sequences, n_failed = load_encoded_sequences(sample_dir=sample_dir)
-    token_stream = concat_with_eos(sequences)
+    n_base_tokens_total = sum(len(s) for s in sequences)
 
-    # Sanity check: all ids must fall within tokenizer vocab.
+    merges: List[Merge] = []
+    if bpe_merges_path is not None and Path(bpe_merges_path).exists():
+        merges = load_bpe_merges(Path(bpe_merges_path))
+        if merges:
+            rng = _random.Random(seed) if bpe_dropout > 0.0 else None
+            sequences = [
+                apply_bpe(s, merges, dropout=bpe_dropout, rng=rng)
+                for s in sequences
+            ]
+
+    vocab_size = effective_vocab_size(VOCAB_SIZE, merges)
+
+    token_stream = concat_with_eos(sequences)
     if token_stream:
         max_id = max(token_stream)
         assert (
-            max_id < VOCAB_SIZE
-        ), f"Found token id {max_id} but vocab size is {VOCAB_SIZE}"
+            max_id < vocab_size
+        ), f"Found token id {max_id} but vocab size is {vocab_size}"
 
     chunks = chunk_token_stream(token_stream=token_stream, block_size=block_size)
     train_chunks, val_chunks = split_chunks(
@@ -181,11 +217,16 @@ def build_dataloaders(
         n_chunks_total=len(chunks),
         n_train_chunks=len(train_chunks),
         n_val_chunks=len(val_chunks),
+        n_bpe_merges=len(merges),
+        vocab_size=vocab_size,
+        n_base_tokens_total=n_base_tokens_total,
     )
     return train_loader, val_loader, stats
 
 
-def _print_decoded_batch_sanity(train_loader: DataLoader) -> None:
+def _print_decoded_batch_sanity(
+    train_loader: DataLoader, merges: Sequence[Merge] = ()
+) -> None:
     """Decode one random sample from a random batch for quick sanity checks."""
     if len(train_loader.dataset) == 0:
         print("[dataset] No train samples available for sanity decode.")
@@ -196,10 +237,11 @@ def _print_decoded_batch_sanity(train_loader: DataLoader) -> None:
     sample_idx = random.randrange(x.shape[0])
     token_ids = x[sample_idx].tolist()
 
-    decoded_pm = decode(token_ids)
+    base_ids = unapply_bpe(token_ids, merges) if merges else token_ids
+    decoded_pm = decode(base_ids)
     n_notes = sum(len(inst.notes) for inst in decoded_pm.instruments)
     token_preview = " ".join(
-        ID2TOKEN.get(tid, f"UNK({tid})") for tid in token_ids[:40]
+        ID2TOKEN.get(tid, f"BPE({tid})") for tid in token_ids[:40]
     )
 
     print("[dataset] Random decoded sample preview (first 40 tokens):")
@@ -215,8 +257,18 @@ if __name__ == "__main__":
         f"{stats.n_files_seen}/{stats.n_files_encoded}/{stats.n_files_failed}"
     )
     print(
-        "[dataset] Tokens/chunks/train/val: "
-        f"{stats.n_tokens_total}/{stats.n_chunks_total}/"
+        "[dataset] Tokens(base/post-bpe)/chunks/train/val: "
+        f"{stats.n_base_tokens_total}/{stats.n_tokens_total}/"
+        f"{stats.n_chunks_total}/"
         f"{stats.n_train_chunks}/{stats.n_val_chunks}"
     )
-    _print_decoded_batch_sanity(train_loader)
+    print(
+        f"[dataset] BPE merges: {stats.n_bpe_merges} "
+        f"(effective vocab: {stats.vocab_size})"
+    )
+    merges = (
+        load_bpe_merges(DEFAULT_BPE_MERGES_PATH)
+        if DEFAULT_BPE_MERGES_PATH.exists()
+        else []
+    )
+    _print_decoded_batch_sanity(train_loader, merges=merges)

@@ -18,7 +18,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from tokenizer import VOCAB_SIZE
+from tokenizer import (
+    ID2TOKEN,
+    N_POS_BINS,
+    PITCH_MAX,
+    PITCH_MIN,
+    VOCAB_SIZE,
+)
+
+
+SCALE_DEGREE_NONE = 12   # sentinel for "no key context / not a pitch"
 
 
 @dataclass
@@ -30,11 +39,97 @@ class GPTConfig:
     n_heads: int = 8
     d_ff: int = 2048
     dropout: float = 0.1
+    # Compound-embedding axes (additive on top of token embedding).
+    use_pitch_class_embed: bool = True   # adds 13 (pc 0..11 + sentinel)
+    use_octave_embed: bool = True        # adds 9  (oct 0..7 + sentinel)
+    use_interval_embed: bool = True      # adds 27 (-13..13 + sentinel) for melodic interval
+    use_beat_cyclic_embed: bool = True   # adds N_POS_BINS+1 for beat-within-bar
+    use_scale_degree_embed: bool = True  # adds 13 (chromatic 0..11 + sentinel) relative to current key
 
 
 def default_gpt_config() -> GPTConfig:
     """Recommended starter config (~10M params with weight tying)."""
     return GPTConfig()
+
+
+# --- Static per-token feature lookups -----------------------------------------
+
+# Sentinel index for "no pitch class / octave applies."
+PC_NONE = 12
+OCT_NONE = 8
+
+
+def _build_token_pitch_feature_tables() -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-token-id buffers giving (pitch_class, octave) for pitch tokens
+    and sentinels otherwise.
+    """
+    pc = torch.full((VOCAB_SIZE,), PC_NONE, dtype=torch.long)
+    oct_ = torch.full((VOCAB_SIZE,), OCT_NONE, dtype=torch.long)
+    for tid, name in ID2TOKEN.items():
+        if (
+            name.startswith("P")
+            and not name.startswith("POS")
+            and name[1:].isdigit()
+        ):
+            midi = int(name[1:])
+            if PITCH_MIN <= midi <= PITCH_MAX:
+                pc[tid] = midi % 12
+                oct_[tid] = max(0, min(7, midi // 12 - 1))
+    return pc, oct_
+
+
+def _is_pitch_token_mask() -> torch.Tensor:
+    """Boolean mask of length VOCAB_SIZE: True for pitch tokens."""
+    mask = torch.zeros(VOCAB_SIZE, dtype=torch.bool)
+    for tid, name in ID2TOKEN.items():
+        if (
+            name.startswith("P")
+            and not name.startswith("POS")
+            and name[1:].isdigit()
+        ):
+            mask[tid] = True
+    return mask
+
+
+def _midi_for_pitch_token(tid: int) -> int:
+    """MIDI number for a pitch token id, or -1 if not a pitch token."""
+    name = ID2TOKEN.get(tid, "")
+    if name.startswith("P") and not name.startswith("POS") and name[1:].isdigit():
+        return int(name[1:])
+    return -1
+
+
+def _build_pitch_to_midi() -> torch.Tensor:
+    """Per-token-id MIDI value for pitch tokens, -1 elsewhere."""
+    arr = torch.full((VOCAB_SIZE,), -1, dtype=torch.long)
+    for tid in range(VOCAB_SIZE):
+        arr[tid] = _midi_for_pitch_token(tid)
+    return arr
+
+
+def _build_pos_token_value() -> torch.Tensor:
+    """For each token id, the POS bin value if it's a POS token, else -1."""
+    arr = torch.full((VOCAB_SIZE,), -1, dtype=torch.long)
+    for tid, name in ID2TOKEN.items():
+        if name.startswith("POS") and name[3:].isdigit():
+            arr[tid] = int(name[3:])
+    return arr
+
+
+def _build_key_token_root() -> torch.Tensor:
+    """For each token id, the root pitch class for KEY tokens (0..11),
+    else -1. KEY_0..11 are major keys C..B; KEY_12..23 are minor keys C..B.
+    """
+    arr = torch.full((VOCAB_SIZE,), -1, dtype=torch.long)
+    for tid, name in ID2TOKEN.items():
+        if name.startswith("KEY_") and name[4:].isdigit():
+            arr[tid] = int(name[4:]) % 12
+    return arr
+
+
+# Interval embedding: clipped to [-13..13] with 27 = sentinel (no interval).
+INTERVAL_RANGE = 13
+INTERVAL_NONE = 2 * INTERVAL_RANGE + 1   # = 27
 
 
 class CausalSelfAttention(nn.Module):
@@ -161,6 +256,36 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.lm_head.weight = self.wte.weight
 
+        # --- Compound (2D) embedding axes ------------------------------------
+        # Static per-token-id feature lookups (computed from tokenizer vocab).
+        pc_tab, oct_tab = _build_token_pitch_feature_tables()
+        self.register_buffer("tok_to_pc", pc_tab, persistent=False)
+        self.register_buffer("tok_to_octave", oct_tab, persistent=False)
+        self.register_buffer(
+            "tok_to_midi", _build_pitch_to_midi(), persistent=False
+        )
+        self.register_buffer(
+            "tok_to_pos_value", _build_pos_token_value(), persistent=False
+        )
+        self.register_buffer(
+            "tok_to_key_root", _build_key_token_root(), persistent=False
+        )
+        self.register_buffer(
+            "tok_is_pitch", _is_pitch_token_mask(), persistent=False
+        )
+
+        if config.use_pitch_class_embed:
+            self.embed_pc = nn.Embedding(PC_NONE + 1, config.d_model)
+        if config.use_octave_embed:
+            self.embed_octave = nn.Embedding(OCT_NONE + 1, config.d_model)
+        if config.use_interval_embed:
+            self.embed_interval = nn.Embedding(INTERVAL_NONE + 1, config.d_model)
+        if config.use_beat_cyclic_embed:
+            # N_POS_BINS bins + sentinel for "no bar context".
+            self.embed_beat = nn.Embedding(N_POS_BINS + 1, config.d_model)
+        if config.use_scale_degree_embed:
+            self.embed_scale_degree = nn.Embedding(SCALE_DEGREE_NONE + 1, config.d_model)
+
         self.apply(self._init_weights)
 
     @staticmethod
@@ -240,7 +365,10 @@ class GPT(nn.Module):
                 pos_e = pos_e.expand(B, -1, -1)
 
         tok = self.wte(idx) if idx is not None else inputs_embeds
-        x = self.drop(tok + pos_e)
+        x = tok + pos_e
+        if idx is not None:
+            x = x + self._compound_embeds(idx)
+        x = self.drop(x)
 
         attn_list: List[torch.Tensor] = []
         present_key_values: List[Tuple[torch.Tensor, torch.Tensor]] = []
@@ -270,6 +398,83 @@ class GPT(nn.Module):
         if use_cache:
             return logits, present_key_values
         return logits
+
+    def _compound_embeds(self, idx: torch.Tensor) -> torch.Tensor:
+        """Sum of all enabled compound (2D) embedding axes for a batch of
+        token ids. Returns a tensor of shape (B, T, d_model) — zero if all
+        axes are disabled."""
+        B, T = idx.shape
+        out = torch.zeros(B, T, self.config.d_model, device=idx.device, dtype=self.wte.weight.dtype)
+
+        if self.config.use_pitch_class_embed:
+            out = out + self.embed_pc(self.tok_to_pc[idx])
+        if self.config.use_octave_embed:
+            out = out + self.embed_octave(self.tok_to_octave[idx])
+        if self.config.use_interval_embed:
+            out = out + self.embed_interval(self._compute_interval_ids(idx))
+        if self.config.use_beat_cyclic_embed:
+            out = out + self.embed_beat(self._compute_beat_ids(idx))
+        if self.config.use_scale_degree_embed:
+            out = out + self.embed_scale_degree(self._compute_scale_degree_ids(idx))
+        return out
+
+    def _compute_scale_degree_ids(self, idx: torch.Tensor) -> torch.Tensor:
+        """For each pitch position, the chromatic scale degree
+        (pitch_class - current_key_root) mod 12 — where current key is the
+        most recent KEY token seen. Non-pitch positions and positions
+        before the first KEY token get the sentinel.
+        """
+        B, T = idx.shape
+        pc = self.tok_to_pc[idx]                              # (B, T) PC_NONE if not pitch
+        key_root = self.tok_to_key_root[idx]                  # (B, T) -1 if not KEY
+        arange = torch.arange(T, device=idx.device).expand(B, T)
+        cand = torch.where(key_root >= 0, arange, torch.full_like(arange, -1))
+        last_key_idx = cand.cummax(dim=1).values
+        safe_idx = last_key_idx.clamp(min=0)
+        cur_root = torch.gather(key_root, 1, safe_idx)
+        # Compute (pc - root) mod 12 for pitch positions with a known key.
+        is_pitch = pc != PC_NONE
+        sd = (pc - cur_root) % 12
+        valid = is_pitch & (last_key_idx >= 0)
+        return torch.where(
+            valid, sd, torch.full_like(sd, SCALE_DEGREE_NONE)
+        )
+
+    def _compute_interval_ids(self, idx: torch.Tensor) -> torch.Tensor:
+        """For each pitch-token position, the clipped melodic interval to the
+        previous pitch token in the same row. Non-pitch positions and the
+        first pitch get the sentinel INTERVAL_NONE. Vectorized via cummax.
+        """
+        B, T = idx.shape
+        midi = self.tok_to_midi[idx]                          # (B, T) -1 if not pitch
+        is_pitch = midi >= 0                                   # (B, T)
+        arange = torch.arange(T, device=idx.device).expand(B, T)
+        cand = torch.where(is_pitch, arange, torch.full_like(arange, -1))
+        # Shift right by 1: previous-pitch-up-to-t-1
+        shifted = torch.cat(
+            [torch.full_like(cand[:, :1], -1), cand[:, :-1]], dim=1
+        )
+        last_idx = shifted.cummax(dim=1).values                # (B, T)
+        safe_idx = last_idx.clamp(min=0)
+        prev_midi = torch.gather(midi, 1, safe_idx)
+        delta = (midi - prev_midi).clamp(-INTERVAL_RANGE, INTERVAL_RANGE) + INTERVAL_RANGE
+        valid = is_pitch & (last_idx >= 0)
+        return torch.where(valid, delta, torch.full_like(delta, INTERVAL_NONE))
+
+    def _compute_beat_ids(self, idx: torch.Tensor) -> torch.Tensor:
+        """For each position, the most recent POS<n> bin value seen so far,
+        or N_POS_BINS (sentinel) if no POS token has been emitted yet.
+        Vectorized via cummax over POS positions."""
+        B, T = idx.shape
+        pos_val = self.tok_to_pos_value[idx]                   # (B, T) -1 if not POS
+        arange = torch.arange(T, device=idx.device).expand(B, T)
+        cand = torch.where(pos_val >= 0, arange, torch.full_like(arange, -1))
+        last_idx = cand.cummax(dim=1).values                   # (B, T)
+        safe_idx = last_idx.clamp(min=0)
+        gathered = torch.gather(pos_val, 1, safe_idx)
+        return torch.where(
+            last_idx >= 0, gathered, torch.full_like(gathered, N_POS_BINS)
+        )
 
     @torch.no_grad()
     def count_parameters(self) -> int:

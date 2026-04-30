@@ -93,33 +93,85 @@ class CompoundGPT(nn.Module):
 
     def forward(
         self,
-        idx: torch.Tensor,
+        idx: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
         return_attn: bool = False,
         return_hidden: bool = False,
+        use_cache: bool = False,
+        past_key_values: Optional[Tuple[torch.Tensor, ...]] = None,
     ) -> List[torch.Tensor] | Tuple[List[torch.Tensor], List[torch.Tensor]] | torch.Tensor:
-        """idx: (B, T, N_AXES) of long feature ids.
+        """Forward pass for compound GPT.
 
         - return_hidden=False, return_attn=False: list of N_AXES logits.
         - return_hidden=True: post-LN hidden states (B, T, d_model). Used by
           the contrastive MIDI encoder for pooling. No classification heads run.
         - return_attn=True: (logits, attn_list).
+
+        Input modes:
+        - ``idx``: (B, T, N_AXES) of long feature ids.
+        - ``inputs_embeds``: (B, T, d_model) precomputed embeddings.
         """
-        if idx.dim() != 3 or idx.shape[-1] != self.n_axes:
-            raise ValueError(
-                f"Expected idx of shape (B, T, {self.n_axes}); got {tuple(idx.shape)}"
+        if use_cache or past_key_values is not None:
+            # Kept for API compatibility with GPT-style call sites.
+            raise NotImplementedError(
+                "CompoundGPT does not currently support KV caching."
             )
-        B, T, _ = idx.shape
+        if (idx is None) == (inputs_embeds is None):
+            raise ValueError("Provide exactly one of idx or inputs_embeds.")
+
+        if inputs_embeds is None:
+            assert idx is not None
+            if idx.dim() != 3 or idx.shape[-1] != self.n_axes:
+                raise ValueError(
+                    f"Expected idx of shape (B, T, {self.n_axes}); got {tuple(idx.shape)}"
+                )
+            B, T, _ = idx.shape
+        else:
+            if inputs_embeds.dim() != 3 or inputs_embeds.size(-1) != self.config.d_model:
+                raise ValueError(
+                    "Expected inputs_embeds shape "
+                    f"(B, T, {self.config.d_model}); got {tuple(inputs_embeds.shape)}"
+                )
+            B, T, _ = inputs_embeds.shape
+
         if T > self.config.block_size:
             raise ValueError(
                 f"Sequence length {T} exceeds block_size {self.config.block_size}"
             )
 
-        x = self.input_embeds[0](idx[..., 0])
-        for a in range(1, self.n_axes):
-            x = x + self.input_embeds[a](idx[..., a])
+        if inputs_embeds is None:
+            assert idx is not None
+            x = self.input_embeds[0](idx[..., 0])
+            for a in range(1, self.n_axes):
+                x = x + self.input_embeds[a](idx[..., a])
+            device = idx.device
+        else:
+            x = inputs_embeds
+            device = inputs_embeds.device
 
-        pos = torch.arange(T, device=idx.device, dtype=torch.long)
-        x = self.drop(x + self.wpe(pos).unsqueeze(0))
+        if position_ids is None:
+            pos = torch.arange(T, device=device, dtype=torch.long).unsqueeze(0)
+        else:
+            if position_ids.dim() == 1:
+                pos = position_ids.unsqueeze(0)
+            elif position_ids.dim() == 2:
+                pos = position_ids
+            else:
+                raise ValueError(
+                    f"position_ids must be shape (T,) or (B, T); got {tuple(position_ids.shape)}"
+                )
+            if pos.size(1) != T:
+                raise ValueError(
+                    f"position_ids length {pos.size(1)} must equal sequence length {T}"
+                )
+            if pos.size(0) not in (1, B):
+                raise ValueError(
+                    f"position_ids batch dim {pos.size(0)} must be 1 or {B}"
+                )
+            pos = pos.to(device=device, dtype=torch.long)
+
+        x = self.drop(x + self.wpe(pos))
 
         attn_list: List[torch.Tensor] = []
         for block in self.blocks:

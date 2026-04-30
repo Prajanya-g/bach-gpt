@@ -9,13 +9,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from contrastive_model import MidiTextContrastiveModel
+from contrastive_model import (
+    CompoundMidiTextContrastiveModel,
+    MidiTextContrastiveModel,
+)
+from compound import SENTINELS, STEP_PAD
+from compound_model import (
+    CompoundGPT,
+    CompoundGPTConfig,
+    compound_loss,
+    default_compound_config,
+)
 from model import GPT, GPTConfig, default_gpt_config
 
 
@@ -90,6 +100,11 @@ def _extract_gpt_config_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
     return {k: raw[k] for k in keys if k in raw}
 
 
+def _extract_compound_gpt_config_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
+    keys = set(CompoundGPTConfig.__dataclass_fields__.keys())
+    return {k: raw[k] for k in keys if k in raw}
+
+
 def _load_gpt_from_checkpoint(
     checkpoint_path: Path, device: torch.device
 ) -> GPT:
@@ -108,6 +123,24 @@ def _load_gpt_from_checkpoint(
     return gpt
 
 
+def _load_compound_gpt_from_checkpoint(
+    checkpoint_path: Path, device: torch.device
+) -> CompoundGPT:
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    cfg = default_compound_config()
+    ckpt_cfg = ckpt.get("config") if isinstance(ckpt, dict) else None
+    if isinstance(ckpt_cfg, dict):
+        for k, v in _extract_compound_gpt_config_dict(ckpt_cfg).items():
+            setattr(cfg, k, v)
+    compound_gpt = CompoundGPT(cfg).to(device)
+    state = ckpt.get("model_state_dict") if isinstance(ckpt, dict) else None
+    if state is None:
+        state = ckpt
+    compound_gpt.load_state_dict(state, strict=False)
+    compound_gpt.eval()
+    return compound_gpt
+
+
 def _load_clap_model(
     clap_checkpoint_path: Path,
     gpt: GPT,
@@ -119,6 +152,36 @@ def _load_clap_model(
     args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
     clap = MidiTextContrastiveModel(
         midi_gpt=gpt,
+        text_model_name=args.get(
+            "text_model", "sentence-transformers/all-MiniLM-L6-v2"
+        ),
+        embed_dim=args.get("embed_dim", 256),
+        init_temperature=args.get("init_temperature", 0.07),
+        min_temperature=args.get("min_temperature", 0.01),
+        max_temperature=args.get("max_temperature", 1.0),
+        device=device,
+    )
+    state = None
+    if isinstance(ckpt, dict):
+        state = ckpt.get("model_state_dict") or ckpt.get("model")
+    if state is None:
+        state = ckpt
+    clap.load_state_dict(state, strict=False)
+    clap.eval()
+    return clap
+
+
+def _load_compound_clap_model(
+    clap_checkpoint_path: Path,
+    compound_gpt: CompoundGPT,
+    device: torch.device,
+) -> CompoundMidiTextContrastiveModel:
+    ckpt = torch.load(
+        clap_checkpoint_path, map_location=device, weights_only=True
+    )
+    args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
+    clap = CompoundMidiTextContrastiveModel(
+        midi_compound_gpt=compound_gpt,
         text_model_name=args.get(
             "text_model", "sentence-transformers/all-MiniLM-L6-v2"
         ),
@@ -204,6 +267,39 @@ def load_phase3_components(
         prefix_projector=projector,
     )
     return clap_model, midi_gpt, projector, counts
+
+
+def load_phase3_compound_components(
+    compound_midi_checkpoint: str,
+    compound_clap_checkpoint: str,
+    n_prefix_tokens: int,
+    device: torch.device,
+) -> Tuple[
+    CompoundMidiTextContrastiveModel,
+    CompoundGPT,
+    PrefixProjector,
+    Phase3FrozenTrainableCounts,
+]:
+    """Load compound CLAP+CompoundGPT, create projector, and enforce freeze policy."""
+    compound_gpt = _load_compound_gpt_from_checkpoint(
+        Path(compound_midi_checkpoint), device=device
+    )
+    compound_clap = _load_compound_clap_model(
+        clap_checkpoint_path=Path(compound_clap_checkpoint),
+        compound_gpt=compound_gpt,
+        device=device,
+    )
+    projector = PrefixProjector(
+        clap_embed_dim=compound_clap.embed_dim,
+        gpt_d_model=compound_gpt.config.d_model,
+        n_prefix_tokens=n_prefix_tokens,
+    ).to(device)
+    counts = freeze_all_except_prefix_projector(
+        clap_model=compound_clap,  # type: ignore[arg-type]
+        midi_gpt=compound_gpt,  # type: ignore[arg-type]
+        prefix_projector=projector,
+    )
+    return compound_clap, compound_gpt, projector, counts
 
 
 def forward_prefix_conditioned_logits(
@@ -343,4 +439,66 @@ def phase3_prefix_lm_loss(
         loss = loss_main + prefix_attn_reg_weight * attn_penalty
     else:
         loss = loss_main
+    return loss, logits_full
+
+
+def phase3_compound_prefix_lm_loss(
+    clap_model: CompoundMidiTextContrastiveModel,
+    midi_compound_gpt: CompoundGPT,
+    prefix_projector: PrefixProjector,
+    compound_input: torch.Tensor,
+    captions: list[str],
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    """Phase 3 loss for compound path using inputs_embeds + compound_loss.
+
+    - Prefix positions are ignored by setting their target step-axis to STEP_PAD.
+    - Uses next-step supervision (shifted by one), mirroring phase3_prefix_lm_loss.
+    """
+    device = compound_input.device
+
+    with torch.no_grad():
+        text_emb = clap_text_for_prefix_projector(
+            clap_model, captions, device  # type: ignore[arg-type]
+        )
+        token_embeds = midi_compound_gpt.input_embeds[0](compound_input[..., 0])
+        for a in range(1, midi_compound_gpt.n_axes):
+            token_embeds = token_embeds + midi_compound_gpt.input_embeds[a](
+                compound_input[..., a]
+            )
+
+    prefix_embeds = prefix_projector(text_emb)
+    k = prefix_embeds.size(1)
+    inputs_embeds = torch.cat([prefix_embeds, token_embeds], dim=1)
+
+    full_len = inputs_embeds.size(1)
+    position_ids = torch.arange(full_len, device=device, dtype=torch.long)
+    position_ids = position_ids.unsqueeze(0).expand(compound_input.size(0), -1)
+
+    logits_full = midi_compound_gpt(
+        inputs_embeds=inputs_embeds,
+        position_ids=position_ids,
+    )
+
+    bsz, seq_len, n_axes = compound_input.shape
+    if n_axes != midi_compound_gpt.n_axes:
+        raise ValueError(
+            f"Expected n_axes={midi_compound_gpt.n_axes}; got {n_axes}"
+        )
+    pad_step = torch.tensor(
+        [STEP_PAD] + SENTINELS[1:],
+        device=device,
+        dtype=torch.long,
+    ).view(1, 1, n_axes)
+    labels_full = pad_step.expand(bsz, k + seq_len, n_axes).clone()
+    if seq_len > 1:
+        labels_full[:, k + 1 :, :] = compound_input[:, 1:, :]
+
+    logits_shift = [logits[:, :-1, :] for logits in logits_full]
+    labels_shift = labels_full[:, 1:, :]
+    loss = compound_loss(
+        logits_per_axis=logits_shift,
+        targets=labels_shift,
+        pad_step_value=STEP_PAD,
+        ignore_pad_steps=True,
+    )
     return loss, logits_full

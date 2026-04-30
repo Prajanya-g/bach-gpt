@@ -10,8 +10,8 @@ export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ROOT=/scratch/pg2963/bach-gpt
-source .venv/bin/activate
 cd $ROOT || exit 1
+source "$ROOT/.venv/bin/activate"
 mkdir -p logs results/test/checkpoints results/test/generated
 
 echo "========================================"

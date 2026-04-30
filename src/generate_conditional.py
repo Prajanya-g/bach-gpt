@@ -16,15 +16,15 @@ from inference_pipeline import (  # noqa: E402
     load_midi_gpt,
     load_prefix_projector,
 )
+from prefix_projector import clap_text_for_prefix_projector  # noqa: E402
 from tokenizer import BAR_END, EOS, ID2TOKEN, PHRASE_END, PHRASE_START, decode
 
 
 def encode_text_prompt(
     clap, prompt: str, device: torch.device
 ) -> torch.Tensor:
-    """Step 1: deterministic CLAP text encoding (batch size 1)."""
-    text_emb = clap.encode_text([prompt], device=device)
-    return F.normalize(text_emb, p=2, dim=-1)
+    """Step 1: CLAP 256-d projected text emb (Phase 3 / contrastive space)."""
+    return clap_text_for_prefix_projector(clap, [prompt], device)
 
 
 def project_prefix(projector, text_emb: torch.Tensor) -> torch.Tensor:

@@ -20,6 +20,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 from caption_dataloader import build_caption_dataloaders  # noqa: E402
 from prefix_projector import (  # noqa: E402
+    clap_text_for_prefix_projector,
     load_phase3_components,
     phase3_prefix_lm_loss,
 )
@@ -270,8 +271,7 @@ def _prefix_token_scale_diagnostics(
 ) -> None:
     x = batch["input_ids"].to(device)
     caps = batch["captions"]
-    text_emb = clap_model.encode_text(caps, device=device)
-    text_emb = F.normalize(text_emb, p=2, dim=-1)
+    text_emb = clap_text_for_prefix_projector(clap_model, caps, device)
     prefix = projector(text_emb)
     token = midi_gpt.wte(x)
     pnorm = float(prefix.norm(dim=-1).mean().item())

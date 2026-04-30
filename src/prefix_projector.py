@@ -19,8 +19,24 @@ from contrastive_model import MidiTextContrastiveModel
 from model import GPT, GPTConfig, default_gpt_config
 
 
+def clap_text_for_prefix_projector(
+    clap_model: MidiTextContrastiveModel,
+    captions: list[str],
+    device: torch.device,
+) -> torch.Tensor:
+    """Text features in the same 256-d space as contrastive training (not raw ST dim).
+
+    ``encode_text`` returns sentence-transformer size (e.g. 384 for MiniLM);
+    ``text_projection`` maps to ``clap_model.embed_dim`` (256), which
+    ``PrefixProjector`` was built for.
+    """
+    raw = clap_model.encode_text(captions, device=device)
+    proj = clap_model.text_projection(raw)
+    return F.normalize(proj, p=2, dim=-1)
+
+
 class PrefixProjector(nn.Module):
-    """Map a 256-d CLAP embedding to K prefix vectors in GPT d_model space."""
+    """Map a 256-d CLAP projected text embedding to K prefix vectors in GPT d_model space."""
 
     def __init__(
         self,
@@ -210,8 +226,9 @@ def forward_prefix_conditioned_logits(
     device = input_ids.device
 
     with torch.no_grad():
-        text_emb = clap_model.encode_text(captions, device=device)
-        text_emb = torch.nn.functional.normalize(text_emb, p=2, dim=-1)
+        text_emb = clap_text_for_prefix_projector(
+            clap_model, captions, device
+        )
         token_embeds = midi_gpt.wte(input_ids)
 
     prefix_embeds = prefix_projector(text_emb)
@@ -265,8 +282,9 @@ def phase3_prefix_lm_loss(
     device = input_ids.device
 
     with torch.no_grad():
-        text_emb = clap_model.encode_text(captions, device=device)
-        text_emb = torch.nn.functional.normalize(text_emb, p=2, dim=-1)
+        text_emb = clap_text_for_prefix_projector(
+            clap_model, captions, device
+        )
         token_embeds = midi_gpt.wte(input_ids)
 
     prefix_embeds = prefix_projector(text_emb)

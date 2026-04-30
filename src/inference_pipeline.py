@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _ROOT = _SCRIPT_DIR.parent
@@ -23,7 +22,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 from contrastive_model import MidiTextContrastiveModel  # noqa: E402
 from model import GPT, GPTConfig, default_gpt_config  # noqa: E402
-from prefix_projector import PrefixProjector  # noqa: E402
+from prefix_projector import PrefixProjector, clap_text_for_prefix_projector  # noqa: E402
 from tokenizer import PHRASE_START  # noqa: E402
 
 
@@ -134,8 +133,7 @@ def smoke_test_forward(
     test_prompt: str,
     device: torch.device,
 ) -> None:
-    text_emb = clap.encode_text([test_prompt], device=device)
-    text_emb = F.normalize(text_emb, p=2, dim=-1)
+    text_emb = clap_text_for_prefix_projector(clap, [test_prompt], device)
     prefix_embeds = projector(text_emb)
 
     input_ids = torch.tensor([[PHRASE_START]], dtype=torch.long, device=device)

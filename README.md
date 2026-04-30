@@ -11,6 +11,8 @@ Mechanistic interpretability experiments on a small GPT-style transformer traine
 - Captioning pipeline (`caption_midi.py` -> `llm_caption.py`) for text-conditioned training data.
 - Caption-conditioned dataloaders with fixed 512-token windows (`src/caption_dataloader.py`).
 - Contrastive MIDI-text architecture (`src/contrastive_model.py`) with frozen encoders + trainable projection heads.
+- Compound (Octuple-style) tokenizer/model path (`src/compound.py`, `src/compound_dataset.py`, `src/compound_model.py`) plus compound contrastive training (`src/train_contrastive_compound.py`).
+- Compound conditional generation (`src/generate_conditional_compound.py`) and compound Phase 3 helpers in `src/prefix_projector.py`.
 - Probing scripts for linear probes, attention analysis, and phrase completion.
 
 ## Project layout
@@ -27,10 +29,15 @@ bach-gpt/
 │   ├── caption_dataloader.py
 │   ├── contrastive_model.py
 │   ├── train_contrastive.py
+│   ├── train_contrastive_compound.py
 │   ├── prefix_projector.py
 │   ├── train_prefix.py
 │   ├── inference_pipeline.py
 │   ├── generate_conditional.py
+│   ├── generate_conditional_compound.py
+│   ├── compound.py
+│   ├── compound_dataset.py
+│   ├── compound_model.py
 │   ├── eval_retrieval.py
 │   ├── download.py
 │   ├── extract_gigamidi_sample.py
@@ -159,6 +166,12 @@ Use `src/caption_dataloader.py` to read `captions_llm.jsonl` for training:
   - `num_workers=4`
   - `pin_memory=True` when CUDA is available
 
+Compound caption dataloader variant:
+
+- `MidiCompoundCaptionDataset` returns `compound_input` with shape `(B, T, N_AXES)`.
+- Padding uses PAD **steps** (`STEP_PAD` on step axis + per-axis sentinels), not scalar token `0`.
+- Helper builder: `build_compound_caption_dataloaders(...)`.
+
 ## Contrastive model architecture (Stage A)
 
 `src/contrastive_model.py` defines `MidiTextContrastiveModel` with four components:
@@ -222,6 +235,12 @@ Batch-size note:
 ## Contrastive training loop (Phase 2d)
 
 `src/train_contrastive.py` trains `MidiTextContrastiveModel` using symmetric InfoNCE.
+
+Compound variant:
+
+- `src/train_contrastive_compound.py` trains `CompoundMidiTextContrastiveModel` from a trained `CompoundGPT` checkpoint.
+- Important checkpoint compatibility rule: keep `CompoundGPT` config (including `block_size`) from the checkpoint when loading weights.
+- You may use a smaller dataloader crop (`--max-seq-len`, e.g. `256`) as long as it is `<=` checkpoint `block_size` (commonly `512`).
 
 ### Optimizer and parameter groups
 
@@ -480,6 +499,23 @@ python3 src/generate_conditional.py \
   --clap-checkpoint results/checkpoints_contrastive/clap_best.pt \
   --prefix-checkpoint results/checkpoints_prefix/prefix_projector_best.pt \
   --out results/conditional_generated.mid
+```
+
+Compound conditional generation:
+
+- `src/generate_conditional_compound.py` performs text-conditioned generation in **compound step space**.
+- At each decode step it samples all `N_AXES` independently from the corresponding per-axis head logits.
+- The generated step sequence is converted to MIDI with `decode_compound(...)`.
+
+Example:
+
+```bash
+python3 src/generate_conditional_compound.py \
+  --prompt "A bright fast piano étude with rising melodic contour." \
+  --compound-midi-checkpoint results/test_compound/checkpoints_compound/compound_best.pt \
+  --compound-clap-checkpoint results/test_compound/checkpoints_contrastive_compound/clap_compound_best.pt \
+  --prefix-checkpoint results/test_compound/checkpoints_prefix/prefix_projector_best.pt \
+  --out results/test_compound/generated_compound_conditional.mid
 ```
 
 ### Retrieval evaluation (4d)

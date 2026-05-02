@@ -219,12 +219,15 @@ class MidiTextContrastiveModel(nn.Module):
             return emb
 
         with torch.no_grad():
-            return self.text_encoder.encode(
+            emb = self.text_encoder.encode(
                 captions,
                 convert_to_tensor=True,
                 device=str(device),
                 normalize_embeddings=False,
             )
+        # SentenceTransformer.encode may use inference_mode internally; clone so
+        # trainable projection heads can participate in autograd.
+        return emb.clone()
 
     def get_temperature(self) -> torch.Tensor:
         return torch.exp(self.log_temperature).clamp(
@@ -395,12 +398,13 @@ class CompoundMidiTextContrastiveModel(nn.Module):
             return emb
 
         with torch.no_grad():
-            return self.text_encoder.encode(
+            emb = self.text_encoder.encode(
                 captions,
                 convert_to_tensor=True,
                 device=str(device),
                 normalize_embeddings=False,
             )
+        return emb.clone()
 
     def get_temperature(self) -> torch.Tensor:
         return torch.exp(self.log_temperature).clamp(

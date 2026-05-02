@@ -404,6 +404,8 @@ class CompoundMidiTextContrastiveModel(nn.Module):
                 device=str(device),
                 normalize_embeddings=False,
             )
+        # SentenceTransformer.encode may use inference_mode internally; clone so
+        # trainable projection heads can participate in autograd.
         return emb.clone()
 
     def get_temperature(self) -> torch.Tensor:

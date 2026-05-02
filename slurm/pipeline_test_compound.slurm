@@ -11,7 +11,15 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 ROOT=/scratch/pg2963/bach-gpt
 cd $ROOT || exit 1
-source "$ROOT/.venv/bin/activate"
+if [ -f "$ROOT/.venv/bin/activate" ]; then
+  # shellcheck source=/dev/null
+  source "$ROOT/.venv/bin/activate"
+elif [ -f "$ROOT/venv/bin/activate" ]; then
+  # shellcheck source=/dev/null
+  source "$ROOT/venv/bin/activate"
+else
+  echo "WARNING: No .venv or venv under $ROOT; using default python" >&2
+fi
 mkdir -p logs results/test_compound/checkpoints_compound
 
 echo "========================================"

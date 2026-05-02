@@ -10,3 +10,29 @@ __pycache__/
 # Check-in deliverables (regenerated from build_giga.js + corpus_stats.py)
 checkin.docx
 checkin.md
+# Logs
+logs/
+*.out
+*.log
+
+# Results & checkpoints
+results/
+results_v2/
+figures/
+
+# SLURM scripts
+*.slurm
+*.sbatch
+
+# W&B
+wandb/
+
+# Data
+*.mid
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env

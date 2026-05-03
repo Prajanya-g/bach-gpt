@@ -21,7 +21,6 @@ results_v2/
 figures/
 
 # SLURM scripts
-*.slurm
 *.sbatch
 
 # W&B

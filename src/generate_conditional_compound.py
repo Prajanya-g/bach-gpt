@@ -90,7 +90,11 @@ def autoregressive_decode_compound(
     bos[0] = STEP_BOS
     generated_steps.append(bos)
 
-    for _ in range(max_new_steps):
+    max_steps = (
+        midi_compound_gpt.config.block_size - prefix_embeds.size(1) - 1
+    )  # -1 for BOS
+
+    for _ in range(min(max_new_steps, max_steps)):
         step_ids = torch.tensor([generated_steps], dtype=torch.long, device=device)
         token_embeds = _compound_step_embeds(midi_compound_gpt, step_ids)
         inputs_embeds = torch.cat([prefix_embeds, token_embeds], dim=1)

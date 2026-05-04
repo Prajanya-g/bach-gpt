@@ -313,6 +313,34 @@ def train(args: argparse.Namespace) -> None:
     global_step = 0
     best_val = float("inf")
     text_group_added = False
+    start_epoch = 1
+
+    if args.resume_checkpoint:
+        ckpt = torch.load(
+            args.resume_checkpoint,
+            map_location=device,
+            weights_only=False,
+        )
+        model.load_state_dict(ckpt["model_state_dict"])
+        if int(ckpt["epoch"]) >= args.unfreeze_text_epoch:
+            model.unfreeze_text_encoder()
+            optimizer.add_param_group(
+                {
+                    "params": model.text_encoder.parameters(),
+                    "lr": args.text_lr,
+                    "initial_lr": args.text_lr,
+                    "weight_decay": args.text_weight_decay,
+                }
+            )
+            text_group_added = True
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        start_epoch = int(ckpt["epoch"]) + 1
+        global_step = int(ckpt["global_step"])
+        best_val = float(ckpt["val_loss"])
+        print(
+            "[compound-contrastive] resumed from "
+            f"epoch={ckpt['epoch']} val_loss={best_val:.4f}"
+        )
 
     results_dir = Path(args.results_dir)
     ckpt_dir = results_dir / "checkpoints_contrastive_compound"
@@ -338,7 +366,7 @@ def train(args: argparse.Namespace) -> None:
             ).writeheader()
 
     t0 = time.perf_counter()
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         if epoch == args.unfreeze_text_epoch and not text_group_added:
             model.unfreeze_text_encoder()
             optimizer.add_param_group(
@@ -485,6 +513,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-lr-scale", type=float, default=0.01)
     p.add_argument("--grad-clip-norm", type=float, default=1.0)
     p.add_argument("--checkpoint-every", type=int, default=5)
+    p.add_argument("--resume-checkpoint", type=str, default="")
     return p.parse_args()
 
 
